@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.metallib
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
