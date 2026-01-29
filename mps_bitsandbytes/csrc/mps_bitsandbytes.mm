@@ -147,12 +147,10 @@ at::Tensor matmul_int8_mps(
     // Allocate output
     auto output = at::empty({M, N}, A.options().dtype(out_dtype));
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuffer = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         // Get buffers
         id<MTLBuffer> A_buf = at::native::mps::getMTLBufferStorage(A_contig);
@@ -186,9 +184,7 @@ at::Tensor matmul_int8_mps(
         );
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        [encoder endEncoding];
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return output;
