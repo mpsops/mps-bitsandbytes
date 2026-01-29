@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-bitsandbytes"
-version = "0.1.0"
+version = "0.1.1"
 description = "8-bit and 4-bit quantization for PyTorch on Apple Silicon (M1/M2/M3/M4)"
 readme = "README.md"
 license = "MIT"
@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/imperatormk/mps-bitsandbytes"
-Repository = "https://github.com/imperatormk/mps-bitsandbytes"
-Issues = "https://github.com/imperatormk/mps-bitsandbytes/issues"
+Homepage = "https://github.com/mpsops/mps-bitsandbytes"
+Repository = "https://github.com/mpsops/mps-bitsandbytes"
+Issues = "https://github.com/mpsops/mps-bitsandbytes/issues"
 
 [tool.setuptools]
 packages = ["mps_bitsandbytes"]
