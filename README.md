@@ -20,7 +20,7 @@ pip install mps-bitsandbytes
 Or from source:
 
 ```bash
-git clone https://github.com/imperatormk/mps-bitsandbytes
+git clone https://github.com/mpsops/mps-bitsandbytes
 cd mps-bitsandbytes
 pip install -e .
 ```
