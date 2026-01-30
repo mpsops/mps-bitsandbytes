@@ -13,6 +13,7 @@ from ..functional import (
     quantize_nf4, dequantize_nf4,
     quantize_fp4, dequantize_fp4,
     quantize_rowwise, dequantize_rowwise,
+    QuantState,
 )
 
 
@@ -28,7 +29,7 @@ class Embedding4bit(nn.Module):
         embedding_dim: Dimension of embeddings
         padding_idx: If specified, entries at this index are zeros
         quant_type: Quantization type ('nf4' or 'fp4')
-        block_size: Block size for quantization (default: 64)
+        blocksize: Block size for quantization (default: 64)
 
     Example:
         >>> embed = Embedding4bit(50000, 4096)
@@ -42,7 +43,7 @@ class Embedding4bit(nn.Module):
         embedding_dim: int,
         padding_idx: Optional[int] = None,
         quant_type: str = 'nf4',
-        block_size: int = 64,
+        blocksize: int = 64,
         device=None,
         dtype=torch.float16,
     ):
@@ -59,10 +60,10 @@ class Embedding4bit(nn.Module):
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
         self.quant_type = quant_type
-        self.block_size = block_size
+        self.blocksize = blocksize
         self.dtype = dtype
 
-        num_blocks = (embedding_dim + block_size - 1) // block_size
+        num_blocks = (embedding_dim + blocksize - 1) // blocksize
 
         # Quantized weight storage
         self.register_buffer(
@@ -95,8 +96,19 @@ class Embedding4bit(nn.Module):
         packed = self.weight_packed[unique_indices]
         absmax = self.weight_absmax[unique_indices]
 
-        # Dequantize
-        embeddings = dequant_fn(packed, absmax, self.block_size, self.dtype)
+        # Create QuantState for each row and dequantize
+        embeddings_list = []
+        for i in range(packed.shape[0]):
+            quant_state = QuantState(
+                absmax=absmax[i],
+                shape=torch.Size([self.embedding_dim]),
+                blocksize=self.blocksize,
+                quant_type=self.quant_type,
+                dtype=self.dtype,
+            )
+            emb = dequant_fn(packed[i], quant_state)
+            embeddings_list.append(emb)
+        embeddings = torch.stack(embeddings_list)
 
         # Gather using inverse indices
         output = embeddings[inverse]
@@ -117,7 +129,7 @@ class Embedding4bit(nn.Module):
         cls,
         embedding: nn.Embedding,
         quant_type: str = 'nf4',
-        block_size: int = 64,
+        blocksize: int = 64,
         device=None,
     ) -> 'Embedding4bit':
         """
@@ -126,7 +138,7 @@ class Embedding4bit(nn.Module):
         Args:
             embedding: Source nn.Embedding layer
             quant_type: Quantization type ('nf4' or 'fp4')
-            block_size: Block size for quantization
+            blocksize: Block size for quantization
 
         Returns:
             Embedding4bit layer with quantized weights
@@ -150,23 +162,31 @@ class Embedding4bit(nn.Module):
             embedding_dim,
             padding_idx=embedding.padding_idx,
             quant_type=quant_type,
-            block_size=block_size,
+            blocksize=blocksize,
             device=device,
             dtype=dtype,
         )
 
-        # Quantize weights
+        # Quantize weights row by row
         quantize_fn = quantize_nf4 if quant_type == 'nf4' else quantize_fp4
-        weight_packed, weight_absmax = quantize_fn(weight.to(device), block_size)
-        layer.weight_packed.copy_(weight_packed)
-        layer.weight_absmax.copy_(weight_absmax)
+        weight_device = weight.to(device)
+        packed_list = []
+        absmax_list = []
+        for i in range(weight_device.shape[0]):
+            packed, state = quantize_fn(weight_device[i], blocksize=blocksize)
+            packed_list.append(packed)
+            absmax_list.append(state.absmax)
+
+        layer.weight_packed.copy_(torch.stack(packed_list))
+        layer.weight_absmax.copy_(torch.stack(absmax_list))
 
         return layer
 
     def extra_repr(self) -> str:
         return (
             f'{self.num_embeddings}, {self.embedding_dim}, '
-            f'padding_idx={self.padding_idx}, quant_type={self.quant_type}'
+            f'padding_idx={self.padding_idx}, quant_type={self.quant_type}, '
+            f'blocksize={self.blocksize}'
         )
 
 
@@ -265,8 +285,8 @@ class EmbeddingNF4(Embedding4bit):
         super().__init__(num_embeddings, embedding_dim, **kwargs)
 
     @classmethod
-    def from_embedding(cls, embedding, block_size: int = 64, device=None) -> 'EmbeddingNF4':
-        return super().from_embedding(embedding, quant_type='nf4', block_size=block_size, device=device)
+    def from_embedding(cls, embedding, blocksize: int = 64, device=None) -> 'EmbeddingNF4':
+        return super().from_embedding(embedding, quant_type='nf4', blocksize=blocksize, device=device)
 
 
 class EmbeddingFP4(Embedding4bit):
@@ -277,5 +297,5 @@ class EmbeddingFP4(Embedding4bit):
         super().__init__(num_embeddings, embedding_dim, **kwargs)
 
     @classmethod
-    def from_embedding(cls, embedding, block_size: int = 64, device=None) -> 'EmbeddingFP4':
-        return super().from_embedding(embedding, quant_type='fp4', block_size=block_size, device=device)
+    def from_embedding(cls, embedding, blocksize: int = 64, device=None) -> 'EmbeddingFP4':
+        return super().from_embedding(embedding, quant_type='fp4', blocksize=blocksize, device=device)

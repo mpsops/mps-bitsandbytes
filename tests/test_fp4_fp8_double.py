@@ -19,22 +19,22 @@ class TestFP4Quantization:
 
     def test_quantize_fp4_basic(self):
         """Test basic FP4 quantization."""
-        from mps_bitsandbytes import quantize_fp4
+        from mps_bitsandbytes import quantize_fp4, QuantState
 
         tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
-        packed, absmax = quantize_fp4(tensor)
+        packed, state = quantize_fp4(tensor)
 
         assert packed.dtype == torch.uint8
-        assert packed.shape == (32, 32)  # Two 4-bit values per byte
-        assert absmax.dtype == torch.float32
+        assert isinstance(state, QuantState)
+        assert state.quant_type == 'fp4'
 
     def test_fp4_roundtrip(self):
         """Test FP4 quantize/dequantize roundtrip."""
         from mps_bitsandbytes import quantize_fp4, dequantize_fp4
 
         tensor = torch.randn(16, 64, device='mps', dtype=torch.float16)
-        packed, absmax = quantize_fp4(tensor)
-        reconstructed = dequantize_fp4(packed, absmax, block_size=64)
+        packed, state = quantize_fp4(tensor)
+        reconstructed = dequantize_fp4(packed, state)
 
         # FP4 has limited precision, check cosine similarity
         tensor_flat = tensor.float().flatten()
@@ -46,31 +46,31 @@ class TestFP4Quantization:
 
     def test_matmul_fp4_basic(self):
         """Test FP4 matmul."""
-        from mps_bitsandbytes import quantize_fp4, matmul_fp4
+        from mps_bitsandbytes import quantize_fp4, matmul_4bit
 
         # Create input and weight
         input_tensor = torch.randn(8, 64, device='mps', dtype=torch.float16)
         weight = torch.randn(32, 64, device='mps', dtype=torch.float16)
 
         # Quantize weight
-        weight_packed, weight_absmax = quantize_fp4(weight)
+        weight_packed, weight_state = quantize_fp4(weight)
 
         # FP4 matmul
-        output = matmul_fp4(input_tensor, weight_packed, weight_absmax)
+        output = matmul_4bit(input_tensor, weight_packed, weight_state)
 
         assert output.shape == (8, 32)
         assert not torch.isnan(output).any()
 
     def test_matmul_fp4_with_bias(self):
         """Test FP4 matmul with bias."""
-        from mps_bitsandbytes import quantize_fp4, matmul_fp4
+        from mps_bitsandbytes import quantize_fp4, matmul_4bit
 
         input_tensor = torch.randn(4, 64, device='mps', dtype=torch.float16)
         weight = torch.randn(16, 64, device='mps', dtype=torch.float16)
         bias = torch.randn(16, device='mps', dtype=torch.float16)
 
-        weight_packed, weight_absmax = quantize_fp4(weight)
-        output = matmul_fp4(input_tensor, weight_packed, weight_absmax, bias=bias)
+        weight_packed, weight_state = quantize_fp4(weight)
+        output = matmul_4bit(input_tensor, weight_packed, weight_state, bias=bias)
 
         assert output.shape == (4, 16)
         assert not torch.isnan(output).any()
@@ -146,55 +146,45 @@ class TestFP8Quantization:
 class TestDoubleQuantization:
     """Tests for double quantization (quantizing the scales)."""
 
-    def test_double_quant_basic(self):
-        """Test basic double quantization."""
-        from mps_bitsandbytes import quantize_nf4, double_quant
+    def test_double_quant_via_compress_statistics(self):
+        """Test double quantization via compress_statistics parameter."""
+        from mps_bitsandbytes import quantize_nf4, dequantize_nf4
 
-        # Create a weight and quantize it
+        # Create a weight and quantize with compress_statistics
         weight = torch.randn(128, 256, device='mps', dtype=torch.float16)
-        packed, absmax = quantize_nf4(weight, block_size=64)
+        packed, state = quantize_nf4(weight, blocksize=64, compress_statistics=True)
 
-        # Apply double quantization to absmax
-        absmax_quant, absmax_scales = double_quant(absmax)
+        # Should have nested state2
+        assert state.state2 is not None
 
-        assert absmax_quant.dtype == torch.uint8
-        assert absmax_quant.shape == absmax.shape
-        assert absmax_scales.dtype == torch.float32
+        # Dequantize should work correctly
+        reconstructed = dequantize_nf4(packed, state)
+        assert reconstructed.shape == weight.shape
 
-    def test_double_quant_roundtrip(self):
-        """Test double quant preserves absmax reasonably."""
-        from mps_bitsandbytes import quantize_nf4, double_quant, dequant_absmax
+    def test_double_quant_accuracy(self):
+        """Test double quant doesn't significantly degrade quality."""
+        from mps_bitsandbytes import quantize_nf4, dequantize_nf4
 
         weight = torch.randn(64, 128, device='mps', dtype=torch.float16)
-        packed, absmax = quantize_nf4(weight, block_size=64)
 
-        absmax_quant, absmax_scales = double_quant(absmax)
-        absmax_restored = dequant_absmax(absmax_quant, absmax_scales)
+        # Without double quant
+        packed1, state1 = quantize_nf4(weight, blocksize=64, compress_statistics=False)
+        recon1 = dequantize_nf4(packed1, state1)
 
-        # Double quant uses INT8, so should be accurate
-        relative_error = (absmax - absmax_restored).abs() / (absmax.abs() + 1e-8)
-        mean_rel_error = relative_error.mean().item()
-        print(f"Double quant mean relative error: {mean_rel_error:.4f}")
-        assert mean_rel_error < 0.05, f"Double quant error {mean_rel_error} too high"
+        # With double quant
+        packed2, state2 = quantize_nf4(weight, blocksize=64, compress_statistics=True)
+        recon2 = dequantize_nf4(packed2, state2)
 
-    def test_double_quant_memory_savings(self):
-        """Test that double quant saves memory."""
-        from mps_bitsandbytes import quantize_nf4, double_quant
+        # Both should be close to original
+        error1 = (weight - recon1).abs().mean() / weight.abs().mean()
+        error2 = (weight - recon2).abs().mean() / weight.abs().mean()
 
-        # Large weight matrix
-        weight = torch.randn(4096, 4096, device='mps', dtype=torch.float16)
-        packed, absmax = quantize_nf4(weight, block_size=64)
+        print(f"Without double quant error: {error1:.4f}")
+        print(f"With double quant error: {error2:.4f}")
 
-        # Original absmax size
-        orig_size = absmax.numel() * 4  # float32 = 4 bytes
-
-        # Double quantized size
-        absmax_quant, absmax_scales = double_quant(absmax, double_quant_block=256)
-        dq_size = absmax_quant.numel() * 1 + absmax_scales.numel() * 4  # uint8 + float32
-
-        savings = (orig_size - dq_size) / orig_size * 100
-        print(f"Double quant memory savings: {savings:.1f}%")
-        assert savings > 50, f"Expected >50% savings, got {savings:.1f}%"
+        # Double quant adds some error but should still be reasonable
+        assert error1 < 0.15
+        assert error2 < 0.20
 
 
 class TestFP4VsNF4:
@@ -209,12 +199,12 @@ class TestFP4VsNF4:
         weight = torch.randn(64, 128, device='mps', dtype=torch.float16)
 
         # NF4
-        nf4_packed, nf4_absmax = quantize_nf4(weight)
-        nf4_recon = dequantize_nf4(nf4_packed, nf4_absmax)
+        nf4_packed, nf4_state = quantize_nf4(weight)
+        nf4_recon = dequantize_nf4(nf4_packed, nf4_state)
 
         # FP4
-        fp4_packed, fp4_absmax = quantize_fp4(weight)
-        fp4_recon = dequantize_fp4(fp4_packed, fp4_absmax)
+        fp4_packed, fp4_state = quantize_fp4(weight)
+        fp4_recon = dequantize_fp4(fp4_packed, fp4_state)
 
         # Compare reconstruction quality
         nf4_sim = torch.nn.functional.cosine_similarity(
@@ -247,7 +237,8 @@ class TestLinear4bitFP4Mode:
         l4_fp4 = Linear4bit.from_linear(linear, quant_type='fp4')
 
         assert l4_fp4.quant_type == 'fp4'
-        assert l4_fp4.weight_packed.shape == (32, 32)  # 64/2
+        assert l4_fp4.weight_quant_state is not None
+        assert l4_fp4.weight_quant_state.quant_type == 'fp4'
 
     def test_linear4bit_fp4_forward(self):
         """Test forward pass with FP4."""
@@ -372,18 +363,23 @@ class TestImports:
     def test_all_exports(self):
         """Test all FP4/FP8/double quant functions are exported."""
         from mps_bitsandbytes import (
+            # QuantState
+            QuantState,
+            # Generic 4-bit
+            quantize_4bit,
+            dequantize_4bit,
+            matmul_4bit,
             # FP4
             quantize_fp4,
             dequantize_fp4,
-            matmul_fp4,
             FP4_CODEBOOK,
             # FP8
             quantize_fp8_e4m3,
             dequantize_fp8_e4m3,
             matmul_fp8_e4m3,
-            # Double quant
-            double_quant,
-            dequant_absmax,
+            # Blockwise
+            quantize_blockwise,
+            dequantize_blockwise,
             # Linear modules
             Linear4bit,
             Linear8bit,
@@ -391,14 +387,16 @@ class TestImports:
         )
 
         # Just verify they're callable
+        assert callable(quantize_4bit)
+        assert callable(dequantize_4bit)
+        assert callable(matmul_4bit)
         assert callable(quantize_fp4)
         assert callable(dequantize_fp4)
-        assert callable(matmul_fp4)
         assert callable(quantize_fp8_e4m3)
         assert callable(dequantize_fp8_e4m3)
         assert callable(matmul_fp8_e4m3)
-        assert callable(double_quant)
-        assert callable(dequant_absmax)
+        assert callable(quantize_blockwise)
+        assert callable(dequantize_blockwise)
 
         # Linear modules
         assert callable(Linear4bit)

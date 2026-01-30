@@ -10,8 +10,8 @@ from torch import nn, Tensor
 from typing import Optional
 
 from ..functional import (
-    quantize_nf4, dequantize_nf4, matmul_nf4,
-    quantize_fp4, dequantize_fp4, matmul_fp4,
+    quantize_4bit, dequantize_4bit, matmul_4bit,
+    QuantState,
 )
 
 
@@ -24,8 +24,8 @@ class Linear4bit(nn.Module):
     quantization used by QLoRA.
 
     Storage format:
-    - weight_packed: [out_features, in_features // 2] uint8
-    - weight_absmax: [out_features, num_blocks] float32
+    - weight: packed uint8 tensor
+    - weight.quant_state: QuantState with absmax, shape, etc.
 
     Args:
         in_features: Input dimension
@@ -34,7 +34,8 @@ class Linear4bit(nn.Module):
         device: Target device
         compute_dtype: Dtype for computation (torch.float16 or torch.bfloat16)
         quant_type: Quantization type ('nf4' or 'fp4')
-        block_size: Block size for quantization (default: 64)
+        blocksize: Block size for quantization (default: 64)
+        compress_statistics: Whether to apply double quantization
 
     Example:
         >>> linear = Linear4bit(1024, 4096)
@@ -50,33 +51,36 @@ class Linear4bit(nn.Module):
         device=None,
         compute_dtype: torch.dtype = torch.float16,
         quant_type: str = 'nf4',
-        block_size: int = 64,
+        blocksize: int = 64,
+        compress_statistics: bool = False,
     ):
         super().__init__()
 
         if quant_type not in ('nf4', 'fp4'):
             raise ValueError(f"quant_type must be 'nf4' or 'fp4', got {quant_type}")
 
-        if in_features % 2 != 0:
-            raise ValueError(f"in_features must be even for 4-bit packing, got {in_features}")
-
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = compute_dtype
         self.quant_type = quant_type
-        self.block_size = block_size
+        self.blocksize = blocksize
+        self.compress_statistics = compress_statistics
 
-        num_blocks = (in_features + block_size - 1) // block_size
+        # Calculate packed size
+        numel = out_features * in_features
+        padded_numel = ((numel + blocksize - 1) // blocksize) * blocksize
+        if padded_numel % 2 != 0:
+            padded_numel += blocksize
+        packed_size = padded_numel // 2
 
         # Quantized weight storage
         self.register_buffer(
-            'weight_packed',
-            torch.zeros(out_features, in_features // 2, dtype=torch.uint8, device=device)
+            'weight',
+            torch.zeros(packed_size, dtype=torch.uint8, device=device)
         )
-        self.register_buffer(
-            'weight_absmax',
-            torch.ones(out_features, num_blocks, dtype=torch.float32, device=device)
-        )
+
+        # QuantState will be set during quantization
+        self.weight_quant_state: Optional[QuantState] = None
 
         # Optional bias
         if bias:
@@ -85,13 +89,6 @@ class Linear4bit(nn.Module):
             )
         else:
             self.register_parameter('bias', None)
-
-        # Metadata for HuggingFace compatibility
-        self.quant_state = {
-            'quant_type': quant_type,
-            'block_size': block_size,
-            'compute_dtype': compute_dtype,
-        }
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -103,23 +100,16 @@ class Linear4bit(nn.Module):
         Returns:
             Output tensor [..., out_features]
         """
+        if self.weight_quant_state is None:
+            raise RuntimeError("Weight not quantized. Call from_linear() or load weights first.")
+
         # Handle batched input
         orig_shape = x.shape
         if x.dim() > 2:
             x = x.view(-1, self.in_features)
 
-        # Select matmul function based on quant_type
-        matmul_fn = matmul_nf4 if self.quant_type == 'nf4' else matmul_fp4
-
-        # Fused 4-bit matmul (dequantize + matmul in Metal kernel)
-        output = matmul_fn(
-            x,
-            self.weight_packed,
-            self.weight_absmax,
-            self.bias,
-            self.block_size,
-            self.compute_dtype
-        )
+        # Fused 4-bit matmul (dequantize + matmul)
+        output = matmul_4bit(x, self.weight, self.weight_quant_state, self.bias)
 
         # Restore batch dimensions
         if len(orig_shape) > 2:
@@ -134,7 +124,8 @@ class Linear4bit(nn.Module):
         device=None,
         compute_dtype: Optional[torch.dtype] = None,
         quant_type: str = 'nf4',
-        block_size: int = 64,
+        blocksize: int = 64,
+        compress_statistics: bool = False,
     ) -> 'Linear4bit':
         """
         Convert a regular nn.Linear to 4-bit quantized.
@@ -144,7 +135,8 @@ class Linear4bit(nn.Module):
             device: Target device (default: same as source)
             compute_dtype: Dtype for computation (default: infer from source)
             quant_type: Quantization type ('nf4' or 'fp4')
-            block_size: Block size for quantization
+            blocksize: Block size for quantization
+            compress_statistics: Apply double quantization to absmax
 
         Returns:
             Linear4bit layer with quantized weights
@@ -162,36 +154,33 @@ class Linear4bit(nn.Module):
             else:
                 compute_dtype = torch.float16
 
-        # Handle odd in_features by padding
         in_features = linear.in_features
-        if in_features % 2 != 0:
-            in_features = in_features + 1
-            # Pad weight with zeros
-            weight = torch.nn.functional.pad(linear.weight.data, (0, 1))
-        else:
-            weight = linear.weight.data
+        out_features = linear.out_features
 
         layer = cls(
             in_features,
-            linear.out_features,
+            out_features,
             bias=linear.bias is not None,
             device=device,
             compute_dtype=compute_dtype,
             quant_type=quant_type,
-            block_size=block_size,
+            blocksize=blocksize,
+            compress_statistics=compress_statistics,
         )
 
-        # Store original in_features for forward if padded
-        layer._original_in_features = linear.in_features
-
-        # Quantize weights (select function based on quant_type)
-        quantize_fn = quantize_nf4 if quant_type == 'nf4' else quantize_fp4
-        weight_packed, weight_absmax = quantize_fn(
-            weight.to(device),
-            block_size=block_size
+        # Quantize weights using bitsandbytes-compatible API
+        weight = linear.weight.data.to(device)
+        weight_packed, quant_state = quantize_4bit(
+            weight,
+            blocksize=blocksize,
+            compress_statistics=compress_statistics,
+            quant_type=quant_type,
         )
-        layer.weight_packed.copy_(weight_packed)
-        layer.weight_absmax.copy_(weight_absmax)
+
+        # Copy quantized weight
+        layer.weight = layer.weight.new_zeros(weight_packed.numel())
+        layer.weight.copy_(weight_packed)
+        layer.weight_quant_state = quant_state
 
         # Copy bias
         if linear.bias is not None:
@@ -208,34 +197,53 @@ class Linear4bit(nn.Module):
         Returns:
             Dequantized weight tensor [out_features, in_features]
         """
-        dequant_fn = dequantize_nf4 if self.quant_type == 'nf4' else dequantize_fp4
-        return dequant_fn(
-            self.weight_packed,
-            self.weight_absmax,
-            self.block_size,
-            self.compute_dtype
-        )
+        if self.weight_quant_state is None:
+            raise RuntimeError("Weight not quantized")
+
+        return dequantize_4bit(self.weight, self.weight_quant_state)
+
+    @property
+    def quant_state(self):
+        """Compatibility property for HuggingFace."""
+        return self.weight_quant_state
 
     def extra_repr(self) -> str:
         return (
             f'in_features={self.in_features}, out_features={self.out_features}, '
             f'bias={self.bias is not None}, quant_type={self.quant_type}, '
-            f'block_size={self.block_size}'
+            f'blocksize={self.blocksize}'
         )
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """Save quantization state along with weights."""
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self.weight_quant_state is not None:
+            destination[prefix + 'weight_quant_state'] = self.weight_quant_state.as_dict()
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         """Handle loading from state dict, including conversion from FP16/FP32."""
+        # Check for quant_state
+        quant_state_key = prefix + 'weight_quant_state'
+        if quant_state_key in state_dict:
+            self.weight_quant_state = QuantState.from_dict(
+                state_dict.pop(quant_state_key),
+                device=self.weight.device
+            )
+
         # Check if we're loading from a non-quantized state dict
         weight_key = prefix + 'weight'
-        packed_key = prefix + 'weight_packed'
-
-        if weight_key in state_dict and packed_key not in state_dict:
-            # Convert from FP16/FP32 weight on the fly
-            weight = state_dict.pop(weight_key)
-            quantize_fn = quantize_nf4 if self.quant_type == 'nf4' else quantize_fp4
-            weight_packed, weight_absmax = quantize_fn(weight, self.block_size)
-            state_dict[packed_key] = weight_packed
-            state_dict[prefix + 'weight_absmax'] = weight_absmax
+        if weight_key in state_dict:
+            weight_data = state_dict[weight_key]
+            # If it's a full-precision weight, quantize it
+            if weight_data.dtype in (torch.float16, torch.float32, torch.bfloat16):
+                weight_packed, quant_state = quantize_4bit(
+                    weight_data,
+                    blocksize=self.blocksize,
+                    compress_statistics=self.compress_statistics,
+                    quant_type=self.quant_type,
+                )
+                state_dict[weight_key] = weight_packed
+                self.weight_quant_state = quant_state
 
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
@@ -262,5 +270,7 @@ class Params4bit(nn.Parameter):
     def shape(self):
         # Return logical shape (unpacked)
         if hasattr(self, 'quant_state') and self.quant_state is not None:
-            return (self.quant_state.get('shape', super().shape))
+            if isinstance(self.quant_state, QuantState):
+                return self.quant_state.shape
+            return self.quant_state.get('shape', super().shape)
         return super().shape

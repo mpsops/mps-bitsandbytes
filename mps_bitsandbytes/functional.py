@@ -2,12 +2,15 @@
 MPS BitsAndBytes - Functional API
 
 Core functions for quantizing, dequantizing, and computing with quantized tensors.
+API compatible with bitsandbytes for drop-in replacement.
+
 Supports: INT8, NF4, FP4, FP8 (E4M3), and Double Quantization.
 """
 
 import torch
 from torch import Tensor
 from typing import Tuple, Optional
+from dataclasses import dataclass
 
 # =============================================================================
 # Codebooks
@@ -28,6 +31,16 @@ FP4_CODEBOOK = torch.tensor([
 ], dtype=torch.float32)
 
 
+def create_normal_map(offset=0.9677083, use_extra_value=True):
+    """Create NF4 codebook (for compatibility with bitsandbytes)."""
+    return NF4_CODEBOOK.clone()
+
+
+def create_fp4_map(signed=True):
+    """Create FP4 codebook (for compatibility with bitsandbytes)."""
+    return FP4_CODEBOOK.clone()
+
+
 def _try_load_native():
     """Try to load native C++ extension."""
     try:
@@ -38,99 +51,448 @@ def _try_load_native():
 
 
 # =============================================================================
-# NF4 (4-bit NormalFloat) - Best for neural network weights
+# QuantState - Matches bitsandbytes API
 # =============================================================================
 
-def quantize_nf4(tensor: Tensor, block_size: int = 64) -> Tuple[Tensor, Tensor]:
+@dataclass
+class QuantState:
     """
-    Quantize tensor to NF4 (4-bit NormalFloat) format.
+    Quantization state for dequantization.
 
-    NF4 is optimized for normally distributed weights (like neural networks).
-    Achieves ~4x memory reduction with minimal accuracy loss.
+    Matches bitsandbytes QuantState for API compatibility.
+
+    Attributes:
+        absmax: Absolute maximum values per block
+        shape: Original tensor shape
+        code: Quantization codebook (NF4 or FP4)
+        blocksize: Block size used for quantization
+        quant_type: 'nf4' or 'fp4'
+        dtype: Original tensor dtype
+        offset: Optional offset tensor
+        state2: Nested QuantState for double quantization
+    """
+    absmax: Tensor
+    shape: torch.Size
+    code: Optional[Tensor] = None
+    blocksize: int = 64
+    quant_type: str = "nf4"
+    dtype: torch.dtype = torch.float16
+    offset: Optional[Tensor] = None
+    state2: Optional['QuantState'] = None
+
+    def __post_init__(self):
+        if self.code is None:
+            self.code = NF4_CODEBOOK if self.quant_type == "nf4" else FP4_CODEBOOK
+
+    def to(self, device):
+        """Move state to device."""
+        self.absmax = self.absmax.to(device)
+        if self.code is not None:
+            self.code = self.code.to(device)
+        if self.offset is not None:
+            self.offset = self.offset.to(device)
+        if self.state2 is not None:
+            self.state2 = self.state2.to(device)
+        return self
+
+    def as_dict(self, packed=False):
+        """Convert to dictionary for serialization."""
+        return {
+            'absmax': self.absmax,
+            'shape': self.shape,
+            'blocksize': self.blocksize,
+            'quant_type': self.quant_type,
+            'dtype': self.dtype,
+            'state2': self.state2.as_dict() if self.state2 else None,
+        }
+
+    @classmethod
+    def from_dict(cls, state_dict, device='cpu'):
+        """Create from dictionary."""
+        state2 = None
+        if state_dict.get('state2') is not None:
+            state2 = cls.from_dict(state_dict['state2'], device)
+
+        return cls(
+            absmax=state_dict['absmax'].to(device),
+            shape=state_dict['shape'],
+            blocksize=state_dict.get('blocksize', 64),
+            quant_type=state_dict.get('quant_type', 'nf4'),
+            dtype=state_dict.get('dtype', torch.float16),
+            state2=state2,
+        )
+
+
+# =============================================================================
+# 4-bit Quantization - bitsandbytes compatible API
+# =============================================================================
+
+def quantize_4bit(
+    A: Tensor,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 64,
+    compress_statistics: bool = False,
+    quant_type: str = "nf4",
+    quant_storage: torch.dtype = torch.uint8,
+) -> Tuple[Tensor, QuantState]:
+    """
+    Quantize tensor to 4-bit NF4 or FP4 format.
 
     Args:
-        tensor: Input [rows, cols], cols must be even
-        block_size: Elements per quantization block (default: 64)
+        A: Input tensor (any shape, will be flattened internally)
+        absmax: Optional pre-allocated absmax tensor
+        out: Optional pre-allocated output tensor
+        blocksize: Elements per quantization block (default: 64)
+        compress_statistics: If True, apply double quantization to absmax
+        quant_type: 'nf4' or 'fp4'
+        quant_storage: dtype for storing quantized values (default: uint8)
 
     Returns:
-        packed: [rows, cols//2] uint8 (two 4-bit values per byte)
-        absmax: [rows, num_blocks] float32 scales
+        Tuple of (quantized tensor, QuantState)
     """
-    if tensor.dim() != 2:
-        raise ValueError(f"Expected 2D tensor, got {tensor.dim()}D")
-    if tensor.size(1) % 2 != 0:
-        raise ValueError(f"cols must be even, got {tensor.size(1)}")
+    if quant_type not in ("nf4", "fp4"):
+        raise ValueError(f"quant_type must be 'nf4' or 'fp4', got {quant_type}")
 
-    _C = _try_load_native()
-    if _C is not None and tensor.device.type == 'mps':
-        return _C.quantize_nf4(tensor, block_size)
-    return _quantize_4bit_python(tensor, block_size, NF4_CODEBOOK)
+    orig_shape = A.shape
+    orig_dtype = A.dtype
+    A = A.contiguous()
+
+    # Flatten to 2D for processing
+    numel = A.numel()
+    # Pad to be divisible by blocksize * 2 (for packing)
+    padded_numel = ((numel + blocksize - 1) // blocksize) * blocksize
+    if padded_numel % 2 != 0:
+        padded_numel += blocksize
+
+    A_flat = torch.zeros(padded_numel, dtype=A.dtype, device=A.device)
+    A_flat[:numel] = A.flatten()
+
+    # Reshape to [num_blocks, blocksize]
+    num_blocks = padded_numel // blocksize
+    A_blocked = A_flat.view(num_blocks, blocksize)
+
+    # Compute absmax per block
+    if absmax is None:
+        absmax = A_blocked.float().abs().max(dim=1).values.clamp(min=1e-8)
+
+    # Normalize and quantize
+    codebook = NF4_CODEBOOK if quant_type == "nf4" else FP4_CODEBOOK
+    codebook = codebook.to(A.device)
+
+    A_norm = A_blocked.float() / absmax.unsqueeze(1)
+
+    # Find nearest codebook entry
+    # [num_blocks, blocksize, 1] vs [1, 1, 16]
+    diffs = (A_norm.unsqueeze(-1) - codebook.view(1, 1, -1)).abs()
+    indices = diffs.argmin(dim=-1).to(torch.uint8)  # [num_blocks, blocksize]
+
+    # Pack two 4-bit values per byte
+    indices_flat = indices.flatten()
+    packed_numel = padded_numel // 2
+    if out is None:
+        out = torch.zeros(packed_numel, dtype=quant_storage, device=A.device)
+
+    out[:] = (indices_flat[0::2] | (indices_flat[1::2] << 4)).to(quant_storage)
+
+    # Double quantization
+    state2 = None
+    if compress_statistics:
+        absmax_quant, state2 = quantize_blockwise(absmax, blocksize=256)
+        absmax = absmax_quant
+
+    quant_state = QuantState(
+        absmax=absmax,
+        shape=orig_shape,
+        blocksize=blocksize,
+        quant_type=quant_type,
+        dtype=orig_dtype,
+        state2=state2,
+    )
+
+    return out, quant_state
 
 
-def dequantize_nf4(packed: Tensor, absmax: Tensor, block_size: int = 64,
-                   dtype: torch.dtype = torch.float16) -> Tensor:
-    """Dequantize NF4 tensor back to floating point."""
-    _C = _try_load_native()
-    if _C is not None and packed.device.type == 'mps':
-        return _C.dequantize_nf4(packed, absmax, block_size, dtype)
-    return _dequantize_4bit_python(packed, absmax, block_size, NF4_CODEBOOK, dtype)
-
-
-def matmul_nf4(input: Tensor, weight_packed: Tensor, weight_absmax: Tensor,
-               bias: Optional[Tensor] = None, block_size: int = 64,
-               dtype: torch.dtype = torch.float16) -> Tensor:
-    """Matrix multiplication with NF4-quantized weights."""
-    _C = _try_load_native()
-    if _C is not None and input.device.type == 'mps':
-        return _C.matmul_nf4(input, weight_packed, weight_absmax, bias, block_size, dtype)
-    return _matmul_4bit_python(input, weight_packed, weight_absmax, bias, block_size, NF4_CODEBOOK, dtype)
-
-
-# =============================================================================
-# FP4 (4-bit Floating Point)
-# =============================================================================
-
-def quantize_fp4(tensor: Tensor, block_size: int = 64) -> Tuple[Tensor, Tensor]:
+def dequantize_4bit(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 64,
+    quant_type: str = "nf4",
+) -> Tensor:
     """
-    Quantize tensor to FP4 (4-bit floating point) format.
-
-    FP4 has better dynamic range than NF4 but may be less optimal
-    for normally distributed weights.
+    Dequantize 4-bit tensor back to floating point.
 
     Args:
-        tensor: Input [rows, cols], cols must be even
-        block_size: Elements per quantization block (default: 64)
+        A: Quantized tensor (packed uint8)
+        quant_state: QuantState from quantize_4bit
+        absmax: Optional absmax (if quant_state not provided)
+        out: Optional pre-allocated output tensor
+        blocksize: Block size (if quant_state not provided)
+        quant_type: 'nf4' or 'fp4' (if quant_state not provided)
 
     Returns:
-        packed: [rows, cols//2] uint8
-        absmax: [rows, num_blocks] float32 scales
+        Dequantized tensor with original shape
     """
-    if tensor.dim() != 2 or tensor.size(1) % 2 != 0:
-        raise ValueError("Input must be 2D with even cols")
+    if quant_state is not None:
+        absmax = quant_state.absmax
+        blocksize = quant_state.blocksize
+        quant_type = quant_state.quant_type
+        shape = quant_state.shape
+        dtype = quant_state.dtype
 
-    _C = _try_load_native()
-    if _C is not None and tensor.device.type == 'mps':
-        return _C.quantize_fp4(tensor, block_size)
-    return _quantize_4bit_python(tensor, block_size, FP4_CODEBOOK)
+        # Handle double quantization
+        if quant_state.state2 is not None:
+            absmax = dequantize_blockwise(absmax, quant_state.state2)
+    else:
+        if absmax is None:
+            raise ValueError("Either quant_state or absmax must be provided")
+        shape = None
+        dtype = torch.float16
+
+    codebook = NF4_CODEBOOK if quant_type == "nf4" else FP4_CODEBOOK
+    codebook = codebook.to(A.device)
+
+    # Unpack
+    low = (A & 0x0F).long()
+    high = ((A >> 4) & 0x0F).long()
+
+    # Interleave
+    unpacked = torch.zeros(A.numel() * 2, dtype=torch.long, device=A.device)
+    unpacked[0::2] = low.flatten()
+    unpacked[1::2] = high.flatten()
+
+    # Reshape to blocks
+    num_blocks = absmax.numel()
+    padded_numel = num_blocks * blocksize
+    unpacked = unpacked[:padded_numel].view(num_blocks, blocksize)
+
+    # Dequantize
+    values = codebook[unpacked]  # [num_blocks, blocksize]
+    values = values * absmax.view(-1, 1)
+
+    # Reshape to original
+    if out is None:
+        if shape is not None:
+            out = values.flatten()[:torch.Size(shape).numel()].view(shape).to(dtype)
+        else:
+            out = values.flatten().to(dtype)
+    else:
+        out[:] = values.flatten()[:out.numel()].view(out.shape).to(dtype)
+
+    return out
 
 
-def dequantize_fp4(packed: Tensor, absmax: Tensor, block_size: int = 64,
-                   dtype: torch.dtype = torch.float16) -> Tensor:
-    """Dequantize FP4 tensor back to floating point."""
-    _C = _try_load_native()
-    if _C is not None and packed.device.type == 'mps':
-        return _C.dequantize_fp4(packed, absmax, block_size, dtype)
-    return _dequantize_4bit_python(packed, absmax, block_size, FP4_CODEBOOK, dtype)
+def quantize_nf4(
+    A: Tensor,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 64,
+    compress_statistics: bool = False,
+    quant_storage: torch.dtype = torch.uint8,
+) -> Tuple[Tensor, QuantState]:
+    """Quantize to NF4 format. Alias for quantize_4bit with quant_type='nf4'."""
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, "nf4", quant_storage)
 
 
-def matmul_fp4(input: Tensor, weight_packed: Tensor, weight_absmax: Tensor,
-               bias: Optional[Tensor] = None, block_size: int = 64,
-               dtype: torch.dtype = torch.float16) -> Tensor:
-    """Matrix multiplication with FP4-quantized weights."""
-    _C = _try_load_native()
-    if _C is not None and input.device.type == 'mps':
-        return _C.matmul_fp4(input, weight_packed, weight_absmax, bias, block_size, dtype)
-    return _matmul_4bit_python(input, weight_packed, weight_absmax, bias, block_size, FP4_CODEBOOK, dtype)
+def dequantize_nf4(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 64,
+) -> Tensor:
+    """Dequantize NF4 tensor. Alias for dequantize_4bit with quant_type='nf4'."""
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "nf4")
+
+
+def quantize_fp4(
+    A: Tensor,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 64,
+    compress_statistics: bool = False,
+    quant_storage: torch.dtype = torch.uint8,
+) -> Tuple[Tensor, QuantState]:
+    """Quantize to FP4 format. Alias for quantize_4bit with quant_type='fp4'."""
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, "fp4", quant_storage)
+
+
+def dequantize_fp4(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 64,
+) -> Tensor:
+    """Dequantize FP4 tensor. Alias for dequantize_4bit with quant_type='fp4'."""
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "fp4")
+
+
+# =============================================================================
+# Blockwise Quantization (INT8)
+# =============================================================================
+
+def quantize_blockwise(
+    A: Tensor,
+    code: Optional[Tensor] = None,
+    absmax: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 4096,
+    nested: bool = False,
+) -> Tuple[Tensor, QuantState]:
+    """
+    Quantize tensor to INT8 using blockwise absmax scaling.
+
+    Args:
+        A: Input tensor
+        code: Optional codebook (unused, for API compatibility)
+        absmax: Optional pre-allocated absmax tensor
+        out: Optional pre-allocated output tensor
+        blocksize: Elements per block
+        nested: If True, apply nested quantization
+
+    Returns:
+        Tuple of (quantized tensor, QuantState)
+    """
+    orig_shape = A.shape
+    orig_dtype = A.dtype
+    A = A.contiguous().flatten()
+    numel = A.numel()
+
+    # Pad to blocksize
+    padded_numel = ((numel + blocksize - 1) // blocksize) * blocksize
+    A_padded = torch.zeros(padded_numel, dtype=A.dtype, device=A.device)
+    A_padded[:numel] = A
+
+    num_blocks = padded_numel // blocksize
+    A_blocked = A_padded.view(num_blocks, blocksize)
+
+    # Compute absmax per block
+    if absmax is None:
+        absmax = A_blocked.float().abs().max(dim=1).values.clamp(min=1e-8)
+
+    # Quantize
+    scale = 127.0 / absmax.unsqueeze(1)
+    if out is None:
+        out = torch.clamp(torch.round(A_blocked.float() * scale), -127, 127).to(torch.int8)
+    else:
+        out[:] = torch.clamp(torch.round(A_blocked.float() * scale), -127, 127).to(torch.int8)
+
+    out = out.flatten()[:numel].view(orig_shape)
+
+    state2 = None
+    if nested:
+        absmax, state2 = quantize_blockwise(absmax, blocksize=256)
+
+    quant_state = QuantState(
+        absmax=absmax,
+        shape=orig_shape,
+        blocksize=blocksize,
+        quant_type="int8",
+        dtype=orig_dtype,
+        state2=state2,
+    )
+
+    return out, quant_state
+
+
+def dequantize_blockwise(
+    A: Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[Tensor] = None,
+    code: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    blocksize: int = 4096,
+    nested: bool = False,
+) -> Tensor:
+    """
+    Dequantize blockwise INT8 tensor.
+
+    Args:
+        A: Quantized int8 tensor
+        quant_state: QuantState from quantize_blockwise
+        absmax: Optional absmax (if quant_state not provided)
+        code: Unused, for API compatibility
+        out: Optional pre-allocated output tensor
+        blocksize: Block size (if quant_state not provided)
+        nested: If True, dequantize nested state first
+
+    Returns:
+        Dequantized tensor
+    """
+    if quant_state is not None:
+        absmax = quant_state.absmax
+        blocksize = quant_state.blocksize
+        shape = quant_state.shape
+        dtype = quant_state.dtype
+
+        if quant_state.state2 is not None:
+            absmax = dequantize_blockwise(absmax, quant_state.state2)
+    else:
+        if absmax is None:
+            raise ValueError("Either quant_state or absmax must be provided")
+        shape = A.shape
+        dtype = torch.float16
+
+    A_flat = A.flatten().float()
+    numel = A_flat.numel()
+
+    # Pad
+    padded_numel = ((numel + blocksize - 1) // blocksize) * blocksize
+    A_padded = torch.zeros(padded_numel, dtype=torch.float32, device=A.device)
+    A_padded[:numel] = A_flat
+
+    num_blocks = padded_numel // blocksize
+    A_blocked = A_padded.view(num_blocks, blocksize)
+
+    # Dequantize
+    scale = absmax.view(-1, 1) / 127.0
+    dequant = A_blocked * scale
+    dequant = dequant.flatten()[:numel].view(shape).to(dtype)
+
+    if out is not None:
+        out[:] = dequant
+        return out
+
+    return dequant
+
+
+# =============================================================================
+# Convenience aliases for old API (backward compatibility)
+# =============================================================================
+
+def quantize_rowwise(tensor: Tensor) -> Tuple[Tensor, Tensor]:
+    """
+    Quantize tensor to INT8 using row-wise absmax scaling.
+
+    Returns:
+        Tuple of (quantized int8 tensor, scales)
+    """
+    orig_shape = tensor.shape
+    tensor_2d = tensor.view(-1, tensor.shape[-1])
+
+    absmax = tensor_2d.float().abs().max(dim=-1).values
+    scales = absmax.clamp(min=1e-8)
+
+    quantized = torch.clamp(
+        torch.round(tensor_2d.float() * (127.0 / scales.unsqueeze(-1))),
+        -127, 127
+    ).to(torch.int8)
+
+    return quantized.view(orig_shape), scales
+
+
+def dequantize_rowwise(quantized: Tensor, scales: Tensor,
+                       dtype: torch.dtype = torch.float16) -> Tensor:
+    """Dequantize INT8 tensor with row-wise scales."""
+    orig_shape = quantized.shape
+    quantized_2d = quantized.view(-1, quantized.shape[-1])
+    scales_2d = scales.view(-1)
+
+    dequantized = (quantized_2d.float() * (scales_2d.unsqueeze(-1) / 127.0)).to(dtype)
+    return dequantized.view(orig_shape)
 
 
 # =============================================================================
@@ -142,14 +504,13 @@ def quantize_fp8_e4m3(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     Quantize tensor to FP8 E4M3 format.
 
     FP8 E4M3 (1 sign, 4 exponent, 3 mantissa) offers better precision
-    than INT8 with similar memory footprint. Range: ±448.
+    than INT8 with similar memory footprint. Range: +/-448.
 
     Args:
-        tensor: Input [rows, cols]
+        tensor: Input tensor
 
     Returns:
-        quantized: [rows, cols] uint8 (FP8 encoded)
-        scales: [rows] float32 row-wise scales
+        Tuple of (quantized uint8 tensor, row-wise scales)
     """
     if tensor.dim() != 2:
         raise ValueError("Input must be 2D")
@@ -169,111 +530,158 @@ def dequantize_fp8_e4m3(quantized: Tensor, scales: Tensor,
     return _dequantize_fp8_e4m3_python(quantized, scales, dtype)
 
 
-def matmul_fp8_e4m3(input: Tensor, weight: Tensor, weight_scales: Tensor,
-                    bias: Optional[Tensor] = None,
-                    dtype: torch.dtype = torch.float16) -> Tensor:
-    """Matrix multiplication with FP8 E4M3 weights."""
-    _C = _try_load_native()
-    if _C is not None and input.device.type == 'mps':
-        return _C.matmul_fp8_e4m3(input, weight, weight_scales, bias, dtype)
-    return _matmul_fp8_python(input, weight, weight_scales, bias, dtype)
-
-
 # =============================================================================
-# INT8 (8-bit Integer)
+# Matrix multiplication with quantized weights
 # =============================================================================
 
-def quantize_rowwise(tensor: Tensor) -> Tuple[Tensor, Tensor]:
+def matmul_4bit(
+    A: Tensor,
+    B: Tensor,
+    quant_state: QuantState,
+    bias: Optional[Tensor] = None,
+) -> Tensor:
     """
-    Quantize tensor to INT8 using row-wise absmax scaling.
+    Matrix multiplication with 4-bit quantized weights.
 
     Args:
-        tensor: Input [..., K]
+        A: Input tensor [..., in_features]
+        B: Quantized weight tensor (packed uint8)
+        quant_state: QuantState from quantize_4bit
+        bias: Optional bias tensor
 
     Returns:
-        quantized: INT8 tensor, same shape
-        scales: Float scales [...] per row
+        Output tensor [..., out_features]
     """
-    orig_shape = tensor.shape
-    tensor_2d = tensor.view(-1, tensor.shape[-1])
+    # Dequantize weights
+    weight = dequantize_4bit(B, quant_state)
 
-    absmax = tensor_2d.abs().max(dim=-1).values
-    scales = absmax.clamp(min=1e-8)
+    # Reshape for matmul if needed
+    orig_shape = A.shape
+    if A.dim() > 2:
+        A = A.view(-1, A.shape[-1])
 
-    quantized = torch.clamp(
-        torch.round(tensor_2d * (127.0 / scales.unsqueeze(-1))),
-        -127, 127
-    ).to(torch.int8)
+    output = torch.nn.functional.linear(A.to(weight.dtype), weight, bias)
 
-    return quantized.view(orig_shape), scales
+    if len(orig_shape) > 2:
+        output = output.view(*orig_shape[:-1], -1)
+
+    return output
 
 
-def dequantize_rowwise(quantized: Tensor, scales: Tensor,
-                       dtype: torch.dtype = torch.float16) -> Tensor:
-    """Dequantize INT8 tensor."""
-    orig_shape = quantized.shape
-    quantized_2d = quantized.view(-1, quantized.shape[-1])
-    scales_2d = scales.view(-1)
+def matmul_nf4(input: Tensor, weight_packed: Tensor, weight_state: QuantState,
+               bias: Optional[Tensor] = None) -> Tensor:
+    """Matrix multiplication with NF4-quantized weights."""
+    return matmul_4bit(input, weight_packed, weight_state, bias)
 
-    dequantized = (quantized_2d.to(dtype) * (scales_2d.unsqueeze(-1) / 127.0).to(dtype))
-    return dequantized.view(orig_shape)
+
+def matmul_fp4(input: Tensor, weight_packed: Tensor, weight_state: QuantState,
+               bias: Optional[Tensor] = None) -> Tensor:
+    """Matrix multiplication with FP4-quantized weights."""
+    return matmul_4bit(input, weight_packed, weight_state, bias)
 
 
 def matmul_int8(A: Tensor, B: Tensor, A_scales: Tensor, B_scales: Tensor,
                 dtype: torch.dtype = torch.float16) -> Tensor:
     """INT8 matmul with fused dequantization."""
-    _C = _try_load_native()
-    if _C is not None and A.device.type == 'mps':
-        return _C.matmul_int8(A, B, A_scales, B_scales, dtype)
-
     A_dequant = dequantize_rowwise(A, A_scales, dtype)
     B_dequant = dequantize_rowwise(B.T, B_scales, dtype).T
     return torch.matmul(A_dequant, B_dequant)
+
+
+def matmul_fp8_e4m3(input: Tensor, weight: Tensor, weight_scales: Tensor,
+                    bias: Optional[Tensor] = None,
+                    dtype: torch.dtype = torch.float16) -> Tensor:
+    """Matrix multiplication with FP8 E4M3 weights."""
+    weight_dequant = dequantize_fp8_e4m3(weight, weight_scales, dtype)
+
+    is_1d = input.dim() == 1
+    if is_1d:
+        input = input.unsqueeze(0)
+
+    output = torch.nn.functional.linear(input.to(dtype), weight_dequant, bias)
+    return output.squeeze(0) if is_1d else output
 
 
 # =============================================================================
 # Double Quantization
 # =============================================================================
 
-def double_quant(absmax: Tensor, double_quant_block: int = 256) -> Tuple[Tensor, Tensor]:
+def double_quant(
+    A: Tensor,
+    col_stats: Optional[Tensor] = None,
+    row_stats: Optional[Tensor] = None,
+    out_col: Optional[Tensor] = None,
+    out_row: Optional[Tensor] = None,
+    threshold: float = 0.0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
     """
-    Apply double quantization to absmax scales.
+    Apply double quantization with row and column statistics.
 
-    Quantizes the absmax values themselves with INT8, providing
-    additional ~10% memory savings on top of 4-bit quantization.
+    This is the bitsandbytes-style double_quant that computes both
+    row and column statistics for LLM.int8() style quantization.
 
     Args:
-        absmax: [rows, num_blocks] float32 absmax values
-        double_quant_block: Block size for double quantization
+        A: Input tensor [rows, cols]
+        col_stats: Optional pre-computed column statistics
+        row_stats: Optional pre-computed row statistics
+        out_col: Optional output for column-quantized
+        out_row: Optional output for row-quantized
+        threshold: Outlier threshold (unused in this impl)
 
     Returns:
-        absmax_quant: [rows, num_blocks] uint8 quantized absmax
-        absmax_scales: [rows, dq_blocks] float32 scales for absmax
+        Tuple of (col_quantized, row_quantized, col_stats, row_stats, outliers)
     """
-    if absmax.dim() != 2:
-        raise ValueError("absmax must be 2D")
+    if A.dim() != 2:
+        raise ValueError("Input must be 2D")
 
-    _C = _try_load_native()
-    if _C is not None and absmax.device.type == 'mps':
-        return _C.double_quant(absmax, double_quant_block)
-    return _double_quant_python(absmax, double_quant_block)
+    A_f32 = A.float()
+
+    if row_stats is None:
+        row_stats = A_f32.abs().max(dim=1).values.clamp(min=1e-8)
+    if col_stats is None:
+        col_stats = A_f32.abs().max(dim=0).values.clamp(min=1e-8)
+
+    # Row-wise quantization
+    if out_row is None:
+        out_row = torch.clamp(
+            torch.round(A_f32 * (127.0 / row_stats.unsqueeze(1))),
+            -127, 127
+        ).to(torch.int8)
+
+    # Column-wise quantization
+    if out_col is None:
+        out_col = torch.clamp(
+            torch.round(A_f32 * (127.0 / col_stats.unsqueeze(0))),
+            -127, 127
+        ).to(torch.int8)
+
+    return out_col, out_row, col_stats, row_stats, None
 
 
 def dequant_absmax(absmax_quant: Tensor, absmax_scales: Tensor,
-                   double_quant_block: int = 256) -> Tensor:
+                   blocksize: int = 256) -> Tensor:
     """Dequantize double-quantized absmax values."""
-    rows, num_blocks = absmax_quant.shape
-    dq_blocks = absmax_scales.size(1)
+    # Handle QuantState
+    if isinstance(absmax_scales, QuantState):
+        return dequantize_blockwise(absmax_quant, absmax_scales)
 
-    absmax = torch.zeros(rows, num_blocks, dtype=torch.float32, device=absmax_quant.device)
+    rows = absmax_quant.shape[0] if absmax_quant.dim() > 1 else 1
+    num_blocks = absmax_quant.numel() // rows if rows > 0 else absmax_quant.numel()
+    dq_blocks = absmax_scales.numel() // rows if rows > 0 else absmax_scales.numel()
+
+    if absmax_quant.dim() == 1:
+        absmax_quant = absmax_quant.unsqueeze(0)
+        absmax_scales = absmax_scales.unsqueeze(0)
+
+    absmax = torch.zeros_like(absmax_quant, dtype=torch.float32)
 
     for dqb in range(dq_blocks):
-        start = dqb * double_quant_block
-        end = min(start + double_quant_block, num_blocks)
+        start = dqb * blocksize
+        end = min(start + blocksize, num_blocks)
         scale = absmax_scales[:, dqb:dqb+1]
         absmax[:, start:end] = absmax_quant[:, start:end].float() * scale
 
-    return absmax
+    return absmax.squeeze(0) if rows == 1 else absmax
 
 
 # =============================================================================
@@ -291,24 +699,18 @@ def quantize_colrow(tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         tensor: Input [rows, cols] tensor
 
     Returns:
-        quantized: [rows, cols] int8 tensor
-        row_scales: [rows] float32 row-wise scales
-        col_scales: [cols] float32 column-wise scales
+        Tuple of (quantized int8, row_scales, col_scales)
     """
     if tensor.dim() != 2:
         raise ValueError("Input must be 2D")
 
     tensor_f32 = tensor.float()
 
-    # Compute row-wise and column-wise absmax
     row_absmax = tensor_f32.abs().max(dim=1).values.clamp(min=1e-8)
     col_absmax = tensor_f32.abs().max(dim=0).values.clamp(min=1e-8)
 
-    # Compute per-element scale as geometric mean of row and col absmax
-    # scale[i,j] = sqrt(row_absmax[i] * col_absmax[j])
     scale_matrix = torch.sqrt(row_absmax.unsqueeze(1) * col_absmax.unsqueeze(0))
 
-    # Quantize using per-element scales
     quantized = torch.clamp(
         torch.round(tensor_f32 * (127.0 / scale_matrix)),
         -127, 127
@@ -320,36 +722,18 @@ def quantize_colrow(tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
 def dequantize_colrow(quantized: Tensor, row_scales: Tensor, col_scales: Tensor,
                       dtype: torch.dtype = torch.float16) -> Tensor:
     """Dequantize INT8 tensor with column+row statistics."""
-    # Reconstruct per-element scale
     scale_matrix = torch.sqrt(row_scales.unsqueeze(1) * col_scales.unsqueeze(0))
-    dequant = quantized.to(dtype) * (scale_matrix / 127.0).to(dtype)
-    return dequant
+    dequant = quantized.float() * (scale_matrix / 127.0)
+    return dequant.to(dtype)
 
 
 def matmul_colrow(input: Tensor, weight_int8: Tensor,
                   weight_row_scales: Tensor, weight_col_scales: Tensor,
                   bias: Optional[Tensor] = None,
                   dtype: torch.dtype = torch.float16) -> Tensor:
-    """
-    Matrix multiplication with column+row quantized weights.
-
-    Args:
-        input: [..., in_features] input tensor
-        weight_int8: [out_features, in_features] int8 weights
-        weight_row_scales: [out_features] row scales
-        weight_col_scales: [in_features] column scales
-        bias: Optional [out_features] bias
-        dtype: Output dtype
-
-    Returns:
-        output: [..., out_features] tensor
-    """
-    # Dequantize weights
+    """Matrix multiplication with column+row quantized weights."""
     weight_dequant = dequantize_colrow(weight_int8, weight_row_scales, weight_col_scales, dtype)
-
-    # Matmul
     output = torch.nn.functional.linear(input.to(dtype), weight_dequant, bias)
-
     return output
 
 
@@ -369,19 +753,7 @@ def spmm_coo(
     Sparse-dense matrix multiplication in COO format.
 
     Computes: sparse @ dense where sparse is in COO format.
-
-    Args:
-        row_indices: [nnz] row indices of non-zero elements
-        col_indices: [nnz] column indices of non-zero elements
-        values: [nnz] values of non-zero elements
-        dense: [sparse_cols, out_features] dense matrix
-        sparse_rows: Number of rows in sparse matrix
-        sparse_cols: Number of columns in sparse matrix
-
-    Returns:
-        output: [sparse_rows, out_features] result
     """
-    # Build sparse tensor
     indices = torch.stack([row_indices, col_indices], dim=0)
     sparse = torch.sparse_coo_tensor(
         indices, values,
@@ -389,8 +761,6 @@ def spmm_coo(
         device=values.device,
         dtype=values.dtype
     )
-
-    # Sparse-dense matmul
     return torch.sparse.mm(sparse, dense)
 
 
@@ -404,44 +774,14 @@ def spmm_coo_int8(
     sparse_cols: int,
     dtype: torch.dtype = torch.float16,
 ) -> Tensor:
-    """
-    Sparse-dense matrix multiplication with INT8 sparse values.
-
-    Args:
-        row_indices: [nnz] row indices
-        col_indices: [nnz] column indices
-        values_int8: [nnz] int8 values
-        values_scale: [1] scale factor (absmax / 127)
-        dense: [sparse_cols, out_features] dense matrix
-        sparse_rows: Number of rows in sparse matrix
-        sparse_cols: Number of columns in sparse matrix
-        dtype: Output dtype
-
-    Returns:
-        output: [sparse_rows, out_features] result
-    """
-    # Dequantize values: val = int8_val * scale
+    """Sparse-dense matrix multiplication with INT8 sparse values."""
     scale = values_scale.item() if values_scale.numel() == 1 else values_scale.to(dtype)
     values = values_int8.to(dtype) * scale
-
     return spmm_coo(row_indices, col_indices, values, dense.to(dtype), sparse_rows, sparse_cols)
 
 
 def sparse_coo_from_dense(tensor: Tensor, threshold: float = 0.0) -> Tuple[Tensor, Tensor, Tensor, int, int]:
-    """
-    Convert dense tensor to COO sparse format.
-
-    Args:
-        tensor: [rows, cols] dense tensor
-        threshold: Sparsity threshold (values with abs < threshold become 0)
-
-    Returns:
-        row_indices: [nnz] row indices
-        col_indices: [nnz] column indices
-        values: [nnz] non-zero values
-        rows: Number of rows
-        cols: Number of columns
-    """
+    """Convert dense tensor to COO sparse format."""
     rows, cols = tensor.shape
 
     if threshold > 0:
@@ -450,7 +790,6 @@ def sparse_coo_from_dense(tensor: Tensor, threshold: float = 0.0) -> Tuple[Tenso
     else:
         sparse = tensor
 
-    # Get non-zero indices and values
     nonzero = sparse.nonzero()
     row_indices = nonzero[:, 0]
     col_indices = nonzero[:, 1]
@@ -464,20 +803,7 @@ def quantize_sparse_coo(
     col_indices: Tensor,
     values: Tensor,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """
-    Quantize sparse COO values to INT8.
-
-    Args:
-        row_indices: [nnz] row indices
-        col_indices: [nnz] column indices
-        values: [nnz] float values
-
-    Returns:
-        row_indices: [nnz] row indices (unchanged)
-        col_indices: [nnz] column indices (unchanged)
-        values_int8: [nnz] int8 quantized values
-        scale: [1] scale factor (to dequantize: val = int8_val * scale)
-    """
+    """Quantize sparse COO values to INT8."""
     absmax = values.float().abs().max().clamp(min=1e-8)
     scale = absmax / 127.0
 
@@ -492,76 +818,6 @@ def quantize_sparse_coo(
 # =============================================================================
 # Python Fallback Implementations
 # =============================================================================
-
-def _quantize_4bit_python(tensor: Tensor, block_size: int, codebook: Tensor) -> Tuple[Tensor, Tensor]:
-    """Generic 4-bit quantization with given codebook."""
-    device = tensor.device
-    rows, cols = tensor.shape
-    num_blocks = (cols + block_size - 1) // block_size
-    tensor_f32 = tensor.float()
-    cb = codebook.to(device)
-
-    # Compute absmax per block
-    absmax_list = []
-    for block in range(num_blocks):
-        start, end = block * block_size, min((block + 1) * block_size, cols)
-        block_absmax = tensor_f32[:, start:end].abs().max(dim=1).values.clamp(min=1e-8)
-        absmax_list.append(block_absmax)
-    absmax = torch.stack(absmax_list, dim=1)
-
-    # Quantize
-    packed = torch.zeros(rows, cols // 2, dtype=torch.uint8, device=device)
-    for block in range(num_blocks):
-        start, end = block * block_size, min((block + 1) * block_size, cols)
-        block_scale = absmax[:, block:block+1]
-
-        for i in range(start, end, 2):
-            if i >= cols:
-                break
-            v0 = tensor_f32[:, i] / block_scale.squeeze(1)
-            v1 = tensor_f32[:, i + 1] / block_scale.squeeze(1) if i + 1 < cols else torch.zeros_like(v0)
-
-            idx0 = (v0.unsqueeze(1) - cb.unsqueeze(0)).abs().argmin(dim=1)
-            idx1 = (v1.unsqueeze(1) - cb.unsqueeze(0)).abs().argmin(dim=1)
-            packed[:, i // 2] = (idx0 | (idx1 << 4)).to(torch.uint8)
-
-    return packed, absmax
-
-
-def _dequantize_4bit_python(packed: Tensor, absmax: Tensor, block_size: int,
-                             codebook: Tensor, dtype: torch.dtype) -> Tensor:
-    """Generic 4-bit dequantization."""
-    device = packed.device
-    rows, cols = packed.size(0), packed.size(1) * 2
-    cb = codebook.to(device)
-    output = torch.zeros(rows, cols, dtype=dtype, device=device)
-
-    for col in range(cols):
-        packed_idx = col // 2
-        position = col % 2
-        block_idx = col // block_size
-
-        packed_val = packed[:, packed_idx]
-        idx = (packed_val & 0x0F) if position == 0 else ((packed_val >> 4) & 0x0F)
-        scale = absmax[:, block_idx]
-        output[:, col] = (cb[idx.long()] * scale).to(dtype)
-
-    return output
-
-
-def _matmul_4bit_python(input: Tensor, weight_packed: Tensor, weight_absmax: Tensor,
-                         bias: Optional[Tensor], block_size: int,
-                         codebook: Tensor, dtype: torch.dtype) -> Tensor:
-    """Generic 4-bit matmul fallback."""
-    weight = _dequantize_4bit_python(weight_packed, weight_absmax, block_size, codebook, dtype)
-
-    is_1d = input.dim() == 1
-    if is_1d:
-        input = input.unsqueeze(0)
-
-    output = torch.nn.functional.linear(input.to(dtype), weight, bias)
-    return output.squeeze(0) if is_1d else output
-
 
 def _fp8_e4m3_to_float(fp8: int) -> float:
     """Convert single FP8 E4M3 value to float."""
@@ -610,11 +866,9 @@ def _quantize_fp8_e4m3_python(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     rows, cols = tensor.shape
     tensor_f32 = tensor.float()
 
-    # Row-wise scaling
     absmax = tensor_f32.abs().max(dim=1).values
     scales = (absmax / 448.0).clamp(min=1e-12)
 
-    # Quantize
     output = torch.zeros(rows, cols, dtype=torch.uint8, device=tensor.device)
     for r in range(rows):
         for c in range(cols):
@@ -637,38 +891,3 @@ def _dequantize_fp8_e4m3_python(quantized: Tensor, scales: Tensor,
             output[r, c] = _fp8_e4m3_to_float(fp8_val) * scale
 
     return output
-
-
-def _matmul_fp8_python(input: Tensor, weight: Tensor, weight_scales: Tensor,
-                       bias: Optional[Tensor], dtype: torch.dtype) -> Tensor:
-    """Python FP8 matmul fallback."""
-    weight_dequant = _dequantize_fp8_e4m3_python(weight, weight_scales, dtype)
-
-    is_1d = input.dim() == 1
-    if is_1d:
-        input = input.unsqueeze(0)
-
-    output = torch.nn.functional.linear(input.to(dtype), weight_dequant, bias)
-    return output.squeeze(0) if is_1d else output
-
-
-def _double_quant_python(absmax: Tensor, double_quant_block: int) -> Tuple[Tensor, Tensor]:
-    """Python double quantization."""
-    rows, num_blocks = absmax.shape
-    dq_blocks = (num_blocks + double_quant_block - 1) // double_quant_block
-
-    absmax_quant = torch.zeros(rows, num_blocks, dtype=torch.uint8, device=absmax.device)
-    absmax_scales = torch.zeros(rows, dq_blocks, dtype=torch.float32, device=absmax.device)
-
-    for dqb in range(dq_blocks):
-        start = dqb * double_quant_block
-        end = min(start + double_quant_block, num_blocks)
-
-        block_max = absmax[:, start:end].abs().max(dim=1).values
-        scale = (block_max / 127.0).clamp(min=1e-12)
-        absmax_scales[:, dqb] = scale
-
-        for i in range(start, end):
-            absmax_quant[:, i] = (absmax[:, i] / scale).clamp(0, 255).round().to(torch.uint8)
-
-    return absmax_quant, absmax_scales

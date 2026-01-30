@@ -7,7 +7,7 @@ of larger models by trading compute for memory.
 
 import torch
 from torch.optim import Optimizer
-from typing import Tuple, Optional, Callable, Dict, Any
+from typing import Tuple, Optional, Callable, Dict, Any, List
 
 
 class PagedAdamW(Optimizer):
@@ -55,17 +55,21 @@ class PagedAdamW(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
                        page_to_cpu=page_to_cpu)
         super().__init__(params, defaults)
+        self._pending_sync = False
 
-    def _page_in(self, state: Dict[str, Any], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Move optimizer states from CPU to device."""
-        exp_avg = state['exp_avg'].to(device, non_blocking=True)
-        exp_avg_sq = state['exp_avg_sq'].to(device, non_blocking=True)
-        return exp_avg, exp_avg_sq
+    def synchronize(self):
+        """Ensure all async transfers are complete. Call before accessing state."""
+        if self._pending_sync:
+            torch.mps.synchronize()
+            self._pending_sync = False
 
-    def _page_out(self, state: Dict[str, Any], exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor):
-        """Move optimizer states back to CPU."""
-        state['exp_avg'] = exp_avg.to('cpu', non_blocking=True)
-        state['exp_avg_sq'] = exp_avg_sq.to('cpu', non_blocking=True)
+    def __del__(self):
+        """Ensure sync on cleanup to prevent crashes."""
+        if hasattr(self, '_pending_sync') and self._pending_sync:
+            try:
+                torch.mps.synchronize()
+            except Exception:
+                pass  # Ignore errors during cleanup
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
@@ -74,6 +78,13 @@ class PagedAdamW(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Sync from previous step's async page-out (lazy sync)
+        if self._pending_sync:
+            torch.mps.synchronize()
+            self._pending_sync = False
+
+        has_mps_params = False
 
         for group in self.param_groups:
             beta1, beta2 = group['betas']
@@ -87,12 +98,12 @@ class PagedAdamW(Optimizer):
                 if grad.is_sparse:
                     raise RuntimeError("PagedAdamW does not support sparse gradients")
 
+                has_mps_params = has_mps_params or (p.device.type == 'mps')
                 state = self.state[p]
 
                 # State initialization
                 if len(state) == 0:
                     state['step'] = 0
-                    # Initialize on CPU if paging enabled
                     storage_device = 'cpu' if page_to_cpu else p.device
                     state['exp_avg'] = torch.zeros_like(
                         p, memory_format=torch.preserve_format, device=storage_device
@@ -103,10 +114,10 @@ class PagedAdamW(Optimizer):
 
                 state['step'] += 1
 
-                # Page in states
+                # Page in states (blocking - need data now)
                 if page_to_cpu:
-                    exp_avg, exp_avg_sq = self._page_in(state, p.device)
-                    torch.mps.synchronize() if p.device.type == 'mps' else None
+                    exp_avg = state['exp_avg'].to(p.device)
+                    exp_avg_sq = state['exp_avg_sq'].to(p.device)
                 else:
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
@@ -129,9 +140,14 @@ class PagedAdamW(Optimizer):
                 denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(group['eps'])
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
-                # Page out states
+                # Page out states (async - don't need data until next step)
                 if page_to_cpu:
-                    self._page_out(state, exp_avg, exp_avg_sq)
+                    state['exp_avg'] = exp_avg.to('cpu', non_blocking=True)
+                    state['exp_avg_sq'] = exp_avg_sq.to('cpu', non_blocking=True)
+
+        # Mark that we need sync before next step
+        if has_mps_params:
+            self._pending_sync = True
 
         return loss
 
@@ -164,6 +180,13 @@ class PagedAdam(PagedAdamW):
             with torch.enable_grad():
                 loss = closure()
 
+        # Sync from previous step's async page-out
+        if self._pending_sync:
+            torch.mps.synchronize()
+            self._pending_sync = False
+
+        has_mps_params = False
+
         for group in self.param_groups:
             beta1, beta2 = group['betas']
             page_to_cpu = group['page_to_cpu']
@@ -180,6 +203,7 @@ class PagedAdam(PagedAdamW):
                 if group['weight_decay'] != 0:
                     grad = grad.add(p, alpha=group['weight_decay'])
 
+                has_mps_params = has_mps_params or (p.device.type == 'mps')
                 state = self.state[p]
 
                 if len(state) == 0:
@@ -195,8 +219,8 @@ class PagedAdam(PagedAdamW):
                 state['step'] += 1
 
                 if page_to_cpu:
-                    exp_avg, exp_avg_sq = self._page_in(state, p.device)
-                    torch.mps.synchronize() if p.device.type == 'mps' else None
+                    exp_avg = state['exp_avg'].to(p.device)
+                    exp_avg_sq = state['exp_avg_sq'].to(p.device)
                 else:
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
@@ -212,7 +236,11 @@ class PagedAdam(PagedAdamW):
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
                 if page_to_cpu:
-                    self._page_out(state, exp_avg, exp_avg_sq)
+                    state['exp_avg'] = exp_avg.to('cpu', non_blocking=True)
+                    state['exp_avg_sq'] = exp_avg_sq.to('cpu', non_blocking=True)
+
+        if has_mps_params:
+            self._pending_sync = True
 
         return loss
 
@@ -242,6 +270,21 @@ class PagedLion(Optimizer):
         defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay,
                        page_to_cpu=page_to_cpu)
         super().__init__(params, defaults)
+        self._pending_sync = False
+
+    def synchronize(self):
+        """Ensure all async transfers are complete. Call before accessing state."""
+        if self._pending_sync:
+            torch.mps.synchronize()
+            self._pending_sync = False
+
+    def __del__(self):
+        """Ensure sync on cleanup to prevent crashes."""
+        if hasattr(self, '_pending_sync') and self._pending_sync:
+            try:
+                torch.mps.synchronize()
+            except Exception:
+                pass
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
@@ -250,6 +293,13 @@ class PagedLion(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Sync from previous step's async page-out
+        if self._pending_sync:
+            torch.mps.synchronize()
+            self._pending_sync = False
+
+        has_mps_params = False
 
         for group in self.param_groups:
             beta1, beta2 = group['betas']
@@ -260,6 +310,7 @@ class PagedLion(Optimizer):
                     continue
 
                 grad = p.grad
+                has_mps_params = has_mps_params or (p.device.type == 'mps')
                 state = self.state[p]
 
                 if len(state) == 0:
@@ -270,8 +321,7 @@ class PagedLion(Optimizer):
 
                 # Page in
                 if page_to_cpu:
-                    exp_avg = state['exp_avg'].to(p.device, non_blocking=True)
-                    torch.mps.synchronize() if p.device.type == 'mps' else None
+                    exp_avg = state['exp_avg'].to(p.device)
                 else:
                     exp_avg = state['exp_avg']
 
@@ -286,8 +336,11 @@ class PagedLion(Optimizer):
                 # Update momentum
                 exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
 
-                # Page out
+                # Page out (async)
                 if page_to_cpu:
                     state['exp_avg'] = exp_avg.to('cpu', non_blocking=True)
+
+        if has_mps_params:
+            self._pending_sync = True
 
         return loss

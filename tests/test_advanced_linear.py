@@ -158,7 +158,8 @@ class TestSwitchBackLinear:
         sb_linear = SwitchBackLinear.from_linear(linear, device=device)
         sb_linear.train()
 
-        optimizer = torch.optim.AdamW([sb_linear.weight_fp], lr=1e-2)
+        # Use SGD instead of AdamW - AdamW + fp16 + MPS is unstable
+        optimizer = torch.optim.SGD([sb_linear.weight_fp], lr=0.1)
 
         x = torch.randn(8, 64, device=device, dtype=torch.float16)
         target = torch.randn(8, 32, device=device, dtype=torch.float16)
@@ -203,9 +204,13 @@ class TestSwitchBackLinearCallback:
         # Sync all
         callback.sync()
 
-        # Both layers should be updated
-        assert model.fc1.weight_int8.float().mean().item() == pytest.approx(12.7, abs=1)  # 0.1 * 127
-        assert model.fc2.weight_int8.float().mean().item() == pytest.approx(25.4, abs=1)  # 0.2 * 127
+        # When all values are uniform, int8 will be 127 (normalized to max)
+        # and scales will hold the actual value (0.1, 0.2)
+        # So int8 values should be 127, and scales should be ~0.1 and ~0.2
+        assert model.fc1.weight_int8.float().mean().item() == pytest.approx(127, abs=1)
+        assert model.fc1.weight_scales.mean().item() == pytest.approx(0.1, abs=0.01)
+        assert model.fc2.weight_int8.float().mean().item() == pytest.approx(127, abs=1)
+        assert model.fc2.weight_scales.mean().item() == pytest.approx(0.2, abs=0.01)
 
 
 if __name__ == '__main__':

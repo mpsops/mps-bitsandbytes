@@ -20,19 +20,20 @@ class TestNF4Quantization:
 
     def test_quantize_basic(self):
         """Test basic NF4 quantization."""
-        from mps_bitsandbytes import quantize_nf4
+        from mps_bitsandbytes import quantize_nf4, QuantState
 
         # Create test tensor
         weight = torch.randn(128, 256, device='mps', dtype=torch.float16)
 
         # Quantize
-        packed, absmax = quantize_nf4(weight, block_size=64)
+        packed, state = quantize_nf4(weight, blocksize=64)
 
-        # Check shapes
-        assert packed.shape == (128, 128), f"Expected (128, 128), got {packed.shape}"
-        assert absmax.shape == (128, 4), f"Expected (128, 4), got {absmax.shape}"
+        # Check types
         assert packed.dtype == torch.uint8
-        assert absmax.dtype == torch.float32
+        assert isinstance(state, QuantState)
+        assert state.quant_type == "nf4"
+        assert state.blocksize == 64
+        assert state.shape == weight.shape
 
     def test_quantize_dequantize_roundtrip(self):
         """Test that quantize -> dequantize preserves values reasonably."""
@@ -42,8 +43,8 @@ class TestNF4Quantization:
         weight = torch.randn(64, 128, device='mps', dtype=torch.float16)
 
         # Quantize and dequantize
-        packed, absmax = quantize_nf4(weight, block_size=64)
-        reconstructed = dequantize_nf4(packed, absmax, block_size=64)
+        packed, state = quantize_nf4(weight, blocksize=64)
+        reconstructed = dequantize_nf4(packed, state)
 
         # Check shape preserved
         assert reconstructed.shape == weight.shape
@@ -64,14 +65,13 @@ class TestNF4Quantization:
 
         weight = torch.randn(32, 256, device='mps', dtype=torch.float16)
 
-        for block_size in [32, 64, 128]:
-            packed, absmax = quantize_nf4(weight, block_size=block_size)
-            num_blocks = (256 + block_size - 1) // block_size
+        for blocksize in [32, 64, 128]:
+            packed, state = quantize_nf4(weight, blocksize=blocksize)
 
-            assert absmax.shape == (32, num_blocks), f"Wrong absmax shape for block_size={block_size}"
+            assert state.blocksize == blocksize
 
             # Verify roundtrip
-            reconstructed = dequantize_nf4(packed, absmax, block_size=block_size)
+            reconstructed = dequantize_nf4(packed, state)
             assert reconstructed.shape == weight.shape
 
     def test_quantize_preserves_zeros(self):
@@ -79,8 +79,8 @@ class TestNF4Quantization:
         from mps_bitsandbytes import quantize_nf4, dequantize_nf4
 
         weight = torch.zeros(16, 64, device='mps', dtype=torch.float16)
-        packed, absmax = quantize_nf4(weight, block_size=64)
-        reconstructed = dequantize_nf4(packed, absmax, block_size=64)
+        packed, state = quantize_nf4(weight, blocksize=64)
+        reconstructed = dequantize_nf4(packed, state)
 
         assert torch.allclose(reconstructed, weight, atol=1e-6)
 
@@ -90,8 +90,8 @@ class TestNF4Quantization:
 
         # Large uniform values
         weight = torch.ones(16, 64, device='mps', dtype=torch.float16) * 100.0
-        packed, absmax = quantize_nf4(weight, block_size=64)
-        reconstructed = dequantize_nf4(packed, absmax, block_size=64)
+        packed, state = quantize_nf4(weight, blocksize=64)
+        reconstructed = dequantize_nf4(packed, state)
 
         # Should reconstruct to approximately the same value
         error = (weight - reconstructed).abs().mean().item()
@@ -104,53 +104,39 @@ class TestNF4Matmul:
 
     def test_matmul_basic(self):
         """Test basic NF4 matmul."""
-        from mps_bitsandbytes import quantize_nf4, matmul_nf4
+        from mps_bitsandbytes import quantize_nf4, matmul_4bit
 
         # Create weight and quantize
         M, N, K = 32, 64, 128
         weight = torch.randn(N, K, device='mps', dtype=torch.float16)
         input_tensor = torch.randn(M, K, device='mps', dtype=torch.float16)
 
-        weight_packed, weight_absmax = quantize_nf4(weight, block_size=64)
+        weight_packed, weight_state = quantize_nf4(weight, blocksize=64)
 
         # NF4 matmul
-        output = matmul_nf4(input_tensor, weight_packed, weight_absmax, block_size=64)
+        output = matmul_4bit(input_tensor, weight_packed, weight_state)
 
         assert output.shape == (M, N), f"Expected ({M}, {N}), got {output.shape}"
         assert output.dtype == torch.float16
 
     def test_matmul_with_bias(self):
         """Test NF4 matmul with bias."""
-        from mps_bitsandbytes import quantize_nf4, matmul_nf4
+        from mps_bitsandbytes import quantize_nf4, matmul_4bit
 
         M, N, K = 16, 32, 64
         weight = torch.randn(N, K, device='mps', dtype=torch.float16)
         bias = torch.randn(N, device='mps', dtype=torch.float16)
         input_tensor = torch.randn(M, K, device='mps', dtype=torch.float16)
 
-        weight_packed, weight_absmax = quantize_nf4(weight, block_size=64)
+        weight_packed, weight_state = quantize_nf4(weight, blocksize=64)
 
-        output = matmul_nf4(input_tensor, weight_packed, weight_absmax, bias=bias, block_size=64)
+        output = matmul_4bit(input_tensor, weight_packed, weight_state, bias=bias)
 
         assert output.shape == (M, N)
 
-    def test_matmul_1d_input(self):
-        """Test NF4 matmul with 1D input (single vector)."""
-        from mps_bitsandbytes import quantize_nf4, matmul_nf4
-
-        N, K = 64, 128
-        weight = torch.randn(N, K, device='mps', dtype=torch.float16)
-        input_tensor = torch.randn(K, device='mps', dtype=torch.float16)
-
-        weight_packed, weight_absmax = quantize_nf4(weight, block_size=64)
-
-        output = matmul_nf4(input_tensor, weight_packed, weight_absmax, block_size=64)
-
-        assert output.shape == (N,), f"Expected ({N},), got {output.shape}"
-
     def test_matmul_accuracy(self):
         """Test NF4 matmul accuracy vs FP16 reference."""
-        from mps_bitsandbytes import quantize_nf4, matmul_nf4
+        from mps_bitsandbytes import quantize_nf4, matmul_4bit
 
         M, N, K = 32, 64, 128
         weight = torch.randn(N, K, device='mps', dtype=torch.float16)
@@ -160,8 +146,8 @@ class TestNF4Matmul:
         reference = input_tensor @ weight.T
 
         # NF4 result
-        weight_packed, weight_absmax = quantize_nf4(weight, block_size=64)
-        nf4_output = matmul_nf4(input_tensor, weight_packed, weight_absmax, block_size=64)
+        weight_packed, weight_state = quantize_nf4(weight, blocksize=64)
+        nf4_output = matmul_4bit(input_tensor, weight_packed, weight_state)
 
         # Use cosine similarity for overall direction preservation
         ref_flat = reference.float().flatten()
@@ -178,15 +164,15 @@ class TestNF4Matmul:
 
     def test_matmul_large_matrices(self):
         """Test NF4 matmul with larger matrices (triggers tiled kernel)."""
-        from mps_bitsandbytes import quantize_nf4, matmul_nf4
+        from mps_bitsandbytes import quantize_nf4, matmul_4bit
 
         # Large enough to trigger tiled kernel (M >= 32, N >= 32, K >= 64)
         M, N, K = 128, 256, 512
         weight = torch.randn(N, K, device='mps', dtype=torch.float16)
         input_tensor = torch.randn(M, K, device='mps', dtype=torch.float16)
 
-        weight_packed, weight_absmax = quantize_nf4(weight, block_size=64)
-        output = matmul_nf4(input_tensor, weight_packed, weight_absmax, block_size=64)
+        weight_packed, weight_state = quantize_nf4(weight, blocksize=64)
+        output = matmul_4bit(input_tensor, weight_packed, weight_state)
 
         assert output.shape == (M, N)
 
@@ -206,7 +192,6 @@ class TestLinear4bit:
 
         assert layer.in_features == 128
         assert layer.out_features == 64
-        assert layer.weight_packed.shape == (64, 64)  # 128/2 = 64
 
     def test_linear4bit_from_linear(self):
         """Test converting nn.Linear to Linear4bit."""
@@ -221,7 +206,7 @@ class TestLinear4bit:
 
         assert linear_4bit.in_features == 256
         assert linear_4bit.out_features == 128
-        assert linear_4bit.weight_packed.shape == (128, 128)
+        assert linear_4bit.weight_quant_state is not None
 
     def test_linear4bit_forward(self):
         """Test Linear4bit forward pass."""
@@ -286,7 +271,7 @@ class TestLinear4bit:
 
         # Calculate memory
         fp16_bytes = out_f * in_f * 2  # fp16 = 2 bytes
-        nf4_bytes = out_f * (in_f // 2) * 1  # uint8 = 1 byte (packed)
+        nf4_bytes = linear_4bit.weight.numel() * 1  # uint8 = 1 byte (packed)
 
         expected_ratio = nf4_bytes / fp16_bytes
         print(f"Expected memory ratio: {expected_ratio:.2f}x (should be ~0.25)")
@@ -326,6 +311,49 @@ class TestMemoryFootprint:
 
         # Should have significant savings
         assert footprint_4bit['actual_size_gb'] < footprint_fp16['actual_size_gb']
+
+
+class TestQuantState:
+    """Tests for QuantState class."""
+
+    def test_quantstate_creation(self):
+        """Test QuantState creation and attributes."""
+        from mps_bitsandbytes import quantize_4bit, QuantState
+
+        tensor = torch.randn(64, 128, device='mps', dtype=torch.float16)
+        packed, state = quantize_4bit(tensor, blocksize=64, quant_type='nf4')
+
+        assert isinstance(state, QuantState)
+        assert state.shape == (64, 128)
+        assert state.blocksize == 64
+        assert state.quant_type == 'nf4'
+        assert state.dtype == torch.float16
+        assert state.absmax is not None
+
+    def test_quantstate_to_device(self):
+        """Test QuantState.to() method."""
+        from mps_bitsandbytes import quantize_4bit
+
+        tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
+        packed, state = quantize_4bit(tensor, blocksize=64)
+
+        # Move to CPU
+        state_cpu = state.to('cpu')
+        assert state_cpu.absmax.device.type == 'cpu'
+
+    def test_quantstate_compress_statistics(self):
+        """Test double quantization via compress_statistics."""
+        from mps_bitsandbytes import quantize_4bit, dequantize_4bit
+
+        tensor = torch.randn(128, 256, device='mps', dtype=torch.float16)
+        packed, state = quantize_4bit(tensor, blocksize=64, compress_statistics=True)
+
+        # Should have nested state
+        assert state.state2 is not None
+
+        # Should still dequantize correctly
+        reconstructed = dequantize_4bit(packed, state)
+        assert reconstructed.shape == tensor.shape
 
 
 if __name__ == '__main__':

@@ -45,25 +45,36 @@ HuggingFace Integration:
 
 import torch as _torch
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
-# Core functional API
+# Core functional API (bitsandbytes-compatible)
 from .functional import (
+    # QuantState class for managing quantization state
+    QuantState,
+    # Generic 4-bit (bitsandbytes API)
+    quantize_4bit,
+    dequantize_4bit,
+    matmul_4bit,
     # NF4 (4-bit NormalFloat - best for neural network weights)
     quantize_nf4,
     dequantize_nf4,
     matmul_nf4,
     NF4_CODEBOOK,
+    create_normal_map,
     # FP4 (4-bit Floating Point - better dynamic range)
     quantize_fp4,
     dequantize_fp4,
     matmul_fp4,
     FP4_CODEBOOK,
+    create_fp4_map,
+    # Blockwise INT8 (bitsandbytes API)
+    quantize_blockwise,
+    dequantize_blockwise,
     # FP8 E4M3 (8-bit - better precision than INT8)
     quantize_fp8_e4m3,
     dequantize_fp8_e4m3,
     matmul_fp8_e4m3,
-    # INT8 (8-bit integer)
+    # INT8 (8-bit integer) - row-wise
     quantize_rowwise,
     dequantize_rowwise,
     matmul_int8,
@@ -131,17 +142,31 @@ __all__ = [
     'is_available',
     'has_native_kernels',
 
+    # QuantState class
+    'QuantState',
+
+    # Generic 4-bit (bitsandbytes API)
+    'quantize_4bit',
+    'dequantize_4bit',
+    'matmul_4bit',
+
     # NF4 functional API (4-bit, optimal for NN weights)
     'quantize_nf4',
     'dequantize_nf4',
     'matmul_nf4',
     'NF4_CODEBOOK',
+    'create_normal_map',
 
     # FP4 functional API (4-bit, better dynamic range)
     'quantize_fp4',
     'dequantize_fp4',
     'matmul_fp4',
     'FP4_CODEBOOK',
+    'create_fp4_map',
+
+    # Blockwise INT8 (bitsandbytes API)
+    'quantize_blockwise',
+    'dequantize_blockwise',
 
     # FP8 functional API (8-bit floating point)
     'quantize_fp8_e4m3',
