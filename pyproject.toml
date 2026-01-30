@@ -4,16 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-bitsandbytes"
-version = "0.1.2"
-description = "8-bit and 4-bit quantization for PyTorch on Apple Silicon (M1/M2/M3/M4)"
+version = "0.2.0"
+description = "NF4/FP4/FP8/INT8 quantization for PyTorch on Apple Silicon with Metal GPU acceleration"
 readme = "README.md"
 license = "MIT"
 authors = [
     {name = "imperatormk"}
 ]
-keywords = ["quantization", "8bit", "4bit", "apple-silicon", "pytorch", "mps", "metal", "qlora", "bitsandbytes"]
+keywords = [
+    "quantization",
+    "4bit",
+    "8bit",
+    "nf4",
+    "qlora",
+    "apple-silicon",
+    "pytorch",
+    "mps",
+    "metal",
+    "bitsandbytes",
+    "llm",
+    "transformers",
+]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS :: MacOS X",
@@ -28,13 +41,24 @@ dependencies = [
     "torch>=2.0.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+transformers = [
+    "transformers>=4.30.0",
+    "accelerate>=0.20.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/mpsops/mps-bitsandbytes"
 Repository = "https://github.com/mpsops/mps-bitsandbytes"
 Issues = "https://github.com/mpsops/mps-bitsandbytes/issues"
+Documentation = "https://github.com/mpsops/mps-bitsandbytes#readme"
 
 [tool.setuptools]
-packages = ["mps_bitsandbytes"]
+packages = ["mps_bitsandbytes", "mps_bitsandbytes.nn"]
 include-package-data = true
 
 [tool.setuptools.package-data]
@@ -42,3 +66,8 @@ mps_bitsandbytes = [
     "kernels/*.metal",
     "kernels/*.metallib",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v"

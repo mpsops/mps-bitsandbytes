@@ -1,5 +1,7 @@
 """
 Setup script for MPS BitsAndBytes
+
+Builds the native Metal extension for GPU-accelerated quantization.
 """
 
 import os
@@ -10,6 +12,7 @@ from setuptools.command.build_ext import build_ext
 
 class ObjCppBuildExt(build_ext):
     """Build extension for Objective-C++ with PyTorch."""
+
     def build_extensions(self):
         import torch
         from torch.utils import cpp_extension
@@ -40,16 +43,16 @@ def get_extensions():
     return [Extension(
         name="mps_bitsandbytes._C",
         sources=["mps_bitsandbytes/csrc/mps_bitsandbytes.mm"],
-        extra_compile_args=["-std=c++17", "-O3"],
+        extra_compile_args=["-std=c++17", "-O3", "-DNDEBUG"],
         extra_link_args=["-framework", "Metal", "-framework", "Foundation"],
     )]
 
 
 setup(
     name="mps-bitsandbytes",
-    version="0.1.0",
-    description="8-bit and 4-bit quantization for PyTorch on Apple Silicon",
-    packages=find_packages(),
+    version="0.2.0",
+    description="4-bit NF4 and 8-bit quantization for PyTorch on Apple Silicon",
+    packages=find_packages(exclude=['tests', 'tests.*']),
     package_data={
         "mps_bitsandbytes": [
             "kernels/*.metal",
@@ -58,6 +61,10 @@ setup(
     },
     include_package_data=True,
     install_requires=["torch>=2.0"],
+    extras_require={
+        "dev": ["pytest>=7.0", "pytest-cov"],
+        "transformers": ["transformers>=4.30.0", "accelerate>=0.20.0"],
+    },
     ext_modules=get_extensions(),
     cmdclass={"build_ext": ObjCppBuildExt},
     python_requires=">=3.10",
