@@ -13,6 +13,9 @@ Features:
 - Metal GPU kernels for fused dequant+matmul
 - HuggingFace transformers compatible API
 - QLoRA training support
+- 8-bit optimizers (Adam8bit, SGD8bit, Lion8bit)
+- Paged optimizers for CPU offloading
+- Quantized embeddings (Embedding4bit, Embedding8bit)
 
 Example:
     >>> import torch
@@ -42,7 +45,7 @@ HuggingFace Integration:
 
 import torch as _torch
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Core functional API
 from .functional import (
@@ -64,13 +67,34 @@ from .functional import (
     quantize_rowwise,
     dequantize_rowwise,
     matmul_int8,
+    # INT8 with column+row statistics (LLM.int8 style)
+    quantize_colrow,
+    dequantize_colrow,
+    matmul_colrow,
     # Double quantization (extra ~10% savings)
     double_quant,
     dequant_absmax,
+    # Sparse matrix operations (COO format)
+    spmm_coo,
+    spmm_coo_int8,
+    sparse_coo_from_dense,
+    quantize_sparse_coo,
 )
 
 # Neural network modules
-from .nn import Linear4bit, Linear8bit, LinearFP8
+from .nn import (
+    Linear4bit, Linear8bit, LinearFP8,
+    Embedding4bit, Embedding8bit, EmbeddingNF4, EmbeddingFP4,
+    OutlierAwareLinear,
+    SwitchBackLinear, SwitchBackLinearCallback,
+)
+
+# 8-bit and paged optimizers
+from .optim import (
+    Adam8bit, AdamW8bit, Lion8bit, SGD8bit,
+    PagedAdam, PagedAdamW, PagedLion,
+    quantize_state, dequantize_state,
+)
 
 # HuggingFace integration
 from .integration import (
@@ -129,14 +153,47 @@ __all__ = [
     'dequantize_rowwise',
     'matmul_int8',
 
+    # INT8 with column+row statistics
+    'quantize_colrow',
+    'dequantize_colrow',
+    'matmul_colrow',
+
     # Double quantization
     'double_quant',
     'dequant_absmax',
+
+    # Sparse matrix operations (COO format)
+    'spmm_coo',
+    'spmm_coo_int8',
+    'sparse_coo_from_dense',
+    'quantize_sparse_coo',
 
     # Neural network modules
     'Linear4bit',
     'Linear8bit',
     'LinearFP8',
+    'Embedding4bit',
+    'Embedding8bit',
+    'EmbeddingNF4',
+    'EmbeddingFP4',
+    'OutlierAwareLinear',
+    'SwitchBackLinear',
+    'SwitchBackLinearCallback',
+
+    # 8-bit optimizers
+    'Adam8bit',
+    'AdamW8bit',
+    'Lion8bit',
+    'SGD8bit',
+
+    # Paged optimizers
+    'PagedAdam',
+    'PagedAdamW',
+    'PagedLion',
+
+    # Optimizer utilities
+    'quantize_state',
+    'dequantize_state',
 
     # HuggingFace integration
     'BitsAndBytesConfig',

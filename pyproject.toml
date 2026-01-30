@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-bitsandbytes"
-version = "0.2.0"
+version = "0.3.0"
 description = "NF4/FP4/FP8/INT8 quantization for PyTorch on Apple Silicon with Metal GPU acceleration"
 readme = "README.md"
 license = "MIT"
@@ -58,7 +58,7 @@ Issues = "https://github.com/mpsops/mps-bitsandbytes/issues"
 Documentation = "https://github.com/mpsops/mps-bitsandbytes#readme"
 
 [tool.setuptools]
-packages = ["mps_bitsandbytes", "mps_bitsandbytes.nn"]
+packages = ["mps_bitsandbytes", "mps_bitsandbytes.nn", "mps_bitsandbytes.optim"]
 include-package-data = true
 
 [tool.setuptools.package-data]

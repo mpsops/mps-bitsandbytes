@@ -277,6 +277,219 @@ def dequant_absmax(absmax_quant: Tensor, absmax_scales: Tensor,
 
 
 # =============================================================================
+# INT8 with Column + Row Statistics (LLM.int8 style)
+# =============================================================================
+
+def quantize_colrow(tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    Quantize matrix using both column-wise and row-wise statistics.
+
+    Uses the geometric mean of row and column absmax for better accuracy.
+    This is the approach used in LLM.int8() for handling varying magnitudes.
+
+    Args:
+        tensor: Input [rows, cols] tensor
+
+    Returns:
+        quantized: [rows, cols] int8 tensor
+        row_scales: [rows] float32 row-wise scales
+        col_scales: [cols] float32 column-wise scales
+    """
+    if tensor.dim() != 2:
+        raise ValueError("Input must be 2D")
+
+    tensor_f32 = tensor.float()
+
+    # Compute row-wise and column-wise absmax
+    row_absmax = tensor_f32.abs().max(dim=1).values.clamp(min=1e-8)
+    col_absmax = tensor_f32.abs().max(dim=0).values.clamp(min=1e-8)
+
+    # Compute per-element scale as geometric mean of row and col absmax
+    # scale[i,j] = sqrt(row_absmax[i] * col_absmax[j])
+    scale_matrix = torch.sqrt(row_absmax.unsqueeze(1) * col_absmax.unsqueeze(0))
+
+    # Quantize using per-element scales
+    quantized = torch.clamp(
+        torch.round(tensor_f32 * (127.0 / scale_matrix)),
+        -127, 127
+    ).to(torch.int8)
+
+    return quantized, row_absmax, col_absmax
+
+
+def dequantize_colrow(quantized: Tensor, row_scales: Tensor, col_scales: Tensor,
+                      dtype: torch.dtype = torch.float16) -> Tensor:
+    """Dequantize INT8 tensor with column+row statistics."""
+    # Reconstruct per-element scale
+    scale_matrix = torch.sqrt(row_scales.unsqueeze(1) * col_scales.unsqueeze(0))
+    dequant = quantized.to(dtype) * (scale_matrix / 127.0).to(dtype)
+    return dequant
+
+
+def matmul_colrow(input: Tensor, weight_int8: Tensor,
+                  weight_row_scales: Tensor, weight_col_scales: Tensor,
+                  bias: Optional[Tensor] = None,
+                  dtype: torch.dtype = torch.float16) -> Tensor:
+    """
+    Matrix multiplication with column+row quantized weights.
+
+    Args:
+        input: [..., in_features] input tensor
+        weight_int8: [out_features, in_features] int8 weights
+        weight_row_scales: [out_features] row scales
+        weight_col_scales: [in_features] column scales
+        bias: Optional [out_features] bias
+        dtype: Output dtype
+
+    Returns:
+        output: [..., out_features] tensor
+    """
+    # Dequantize weights
+    weight_dequant = dequantize_colrow(weight_int8, weight_row_scales, weight_col_scales, dtype)
+
+    # Matmul
+    output = torch.nn.functional.linear(input.to(dtype), weight_dequant, bias)
+
+    return output
+
+
+# =============================================================================
+# Sparse Matrix Multiplication (COO format)
+# =============================================================================
+
+def spmm_coo(
+    row_indices: Tensor,
+    col_indices: Tensor,
+    values: Tensor,
+    dense: Tensor,
+    sparse_rows: int,
+    sparse_cols: int,
+) -> Tensor:
+    """
+    Sparse-dense matrix multiplication in COO format.
+
+    Computes: sparse @ dense where sparse is in COO format.
+
+    Args:
+        row_indices: [nnz] row indices of non-zero elements
+        col_indices: [nnz] column indices of non-zero elements
+        values: [nnz] values of non-zero elements
+        dense: [sparse_cols, out_features] dense matrix
+        sparse_rows: Number of rows in sparse matrix
+        sparse_cols: Number of columns in sparse matrix
+
+    Returns:
+        output: [sparse_rows, out_features] result
+    """
+    # Build sparse tensor
+    indices = torch.stack([row_indices, col_indices], dim=0)
+    sparse = torch.sparse_coo_tensor(
+        indices, values,
+        size=(sparse_rows, sparse_cols),
+        device=values.device,
+        dtype=values.dtype
+    )
+
+    # Sparse-dense matmul
+    return torch.sparse.mm(sparse, dense)
+
+
+def spmm_coo_int8(
+    row_indices: Tensor,
+    col_indices: Tensor,
+    values_int8: Tensor,
+    values_scale: Tensor,
+    dense: Tensor,
+    sparse_rows: int,
+    sparse_cols: int,
+    dtype: torch.dtype = torch.float16,
+) -> Tensor:
+    """
+    Sparse-dense matrix multiplication with INT8 sparse values.
+
+    Args:
+        row_indices: [nnz] row indices
+        col_indices: [nnz] column indices
+        values_int8: [nnz] int8 values
+        values_scale: [1] scale factor (absmax / 127)
+        dense: [sparse_cols, out_features] dense matrix
+        sparse_rows: Number of rows in sparse matrix
+        sparse_cols: Number of columns in sparse matrix
+        dtype: Output dtype
+
+    Returns:
+        output: [sparse_rows, out_features] result
+    """
+    # Dequantize values: val = int8_val * scale
+    scale = values_scale.item() if values_scale.numel() == 1 else values_scale.to(dtype)
+    values = values_int8.to(dtype) * scale
+
+    return spmm_coo(row_indices, col_indices, values, dense.to(dtype), sparse_rows, sparse_cols)
+
+
+def sparse_coo_from_dense(tensor: Tensor, threshold: float = 0.0) -> Tuple[Tensor, Tensor, Tensor, int, int]:
+    """
+    Convert dense tensor to COO sparse format.
+
+    Args:
+        tensor: [rows, cols] dense tensor
+        threshold: Sparsity threshold (values with abs < threshold become 0)
+
+    Returns:
+        row_indices: [nnz] row indices
+        col_indices: [nnz] column indices
+        values: [nnz] non-zero values
+        rows: Number of rows
+        cols: Number of columns
+    """
+    rows, cols = tensor.shape
+
+    if threshold > 0:
+        mask = tensor.abs() >= threshold
+        sparse = tensor * mask
+    else:
+        sparse = tensor
+
+    # Get non-zero indices and values
+    nonzero = sparse.nonzero()
+    row_indices = nonzero[:, 0]
+    col_indices = nonzero[:, 1]
+    values = sparse[row_indices, col_indices]
+
+    return row_indices, col_indices, values, rows, cols
+
+
+def quantize_sparse_coo(
+    row_indices: Tensor,
+    col_indices: Tensor,
+    values: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """
+    Quantize sparse COO values to INT8.
+
+    Args:
+        row_indices: [nnz] row indices
+        col_indices: [nnz] column indices
+        values: [nnz] float values
+
+    Returns:
+        row_indices: [nnz] row indices (unchanged)
+        col_indices: [nnz] column indices (unchanged)
+        values_int8: [nnz] int8 quantized values
+        scale: [1] scale factor (to dequantize: val = int8_val * scale)
+    """
+    absmax = values.float().abs().max().clamp(min=1e-8)
+    scale = absmax / 127.0
+
+    values_int8 = torch.clamp(
+        torch.round(values.float() / scale),
+        -127, 127
+    ).to(torch.int8)
+
+    return row_indices, col_indices, values_int8, scale.view(1)
+
+
+# =============================================================================
 # Python Fallback Implementations
 # =============================================================================
 
