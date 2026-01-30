@@ -207,6 +207,17 @@ class Linear4bit(nn.Module):
         """Compatibility property for HuggingFace."""
         return self.weight_quant_state
 
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the quantized weights.
+
+        This is a convenience property for LoRA adapters and other code
+        that needs to create tensors on the same device as this layer.
+        Standard PyTorch uses weight.device, but since our weight is a
+        buffer (not a parameter), next(module.parameters()) may fail.
+        """
+        return self.weight.device
+
     def extra_repr(self) -> str:
         return (
             f'in_features={self.in_features}, out_features={self.out_features}, '

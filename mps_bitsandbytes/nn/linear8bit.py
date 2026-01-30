@@ -150,6 +150,15 @@ class Linear8bit(nn.Module):
 
         return layer
 
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the quantized weights.
+
+        Convenience property for LoRA adapters and other code that needs
+        to create tensors on the same device as this layer.
+        """
+        return self.weight_int8.device
+
     def extra_repr(self) -> str:
         return (
             f'in_features={self.in_features}, out_features={self.out_features}, '
