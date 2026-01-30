@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-bitsandbytes"
-version = "0.1.1"
+version = "0.1.2"
 description = "8-bit and 4-bit quantization for PyTorch on Apple Silicon (M1/M2/M3/M4)"
 readme = "README.md"
 license = "MIT"

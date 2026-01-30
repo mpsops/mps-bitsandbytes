@@ -12,7 +12,7 @@ from torch import nn
 from typing import Optional, Tuple
 import os
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 def is_available() -> bool:
@@ -48,22 +48,23 @@ def quantize_rowwise(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return quantized.view(orig_shape), scales
 
 
-def dequantize_rowwise(quantized: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def dequantize_rowwise(quantized: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype = torch.float16) -> torch.Tensor:
     """
-    Dequantize an int8 tensor back to float16.
+    Dequantize an int8 tensor back to float.
 
     Args:
         quantized: Int8 tensor
         scales: Absmax scales from quantization
+        dtype: Output dtype (torch.float16 or torch.bfloat16)
 
     Returns:
-        Dequantized fp16 tensor
+        Dequantized tensor in specified dtype
     """
     orig_shape = quantized.shape
     quantized_2d = quantized.view(-1, quantized.shape[-1])
     scales_2d = scales.view(-1)
 
-    dequantized = (quantized_2d.to(torch.float16) * (scales_2d.unsqueeze(-1) / 127.0).to(torch.float16))
+    dequantized = (quantized_2d.to(dtype) * (scales_2d.unsqueeze(-1) / 127.0).to(dtype))
     return dequantized.view(orig_shape)
 
 
@@ -71,11 +72,11 @@ class Linear8bit(nn.Module):
     """
     8-bit quantized linear layer for memory-efficient inference and QLoRA training.
 
-    Stores weights in int8 (50% memory savings), dequantizes to fp16 for
+    Stores weights in int8 (50% memory savings), dequantizes to fp16/bf16 for
     fast AMX-accelerated matmul on Apple Silicon.
 
     For QLoRA: Add LoRA adapters on top of this layer. The int8 weights
-    stay frozen while LoRA trains in fp16.
+    stay frozen while LoRA trains in fp16/bf16.
 
     Args:
         in_features: Input dimension
@@ -83,6 +84,7 @@ class Linear8bit(nn.Module):
         bias: Whether to use bias
         device: Target device
         use_cache: If True, cache dequantized weights (faster but uses more memory)
+        compute_dtype: Dtype for dequantized weights (torch.float16 or torch.bfloat16)
     """
 
     def __init__(
@@ -92,11 +94,13 @@ class Linear8bit(nn.Module):
         bias: bool = True,
         device=None,
         use_cache: bool = True,
+        compute_dtype: torch.dtype = torch.float16,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.use_cache = use_cache
+        self.compute_dtype = compute_dtype
 
         # Quantized weight storage (int8)
         self.register_buffer(
@@ -105,44 +109,44 @@ class Linear8bit(nn.Module):
         )
         self.register_buffer(
             'weight_scales',
-            torch.ones(out_features, dtype=torch.float16, device=device)
+            torch.ones(out_features, dtype=torch.float32, device=device)  # Store scales in fp32 for precision
         )
 
-        # Optional bias (fp16)
+        # Optional bias (stored in compute_dtype)
         if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float16, device=device))
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=compute_dtype, device=device))
         else:
             self.register_parameter('bias', None)
 
         # Cache for dequantized weights
-        self._weight_fp16: Optional[torch.Tensor] = None
+        self._weight_cache: Optional[torch.Tensor] = None
 
     def _get_weight(self) -> torch.Tensor:
-        """Get fp16 weight, using cache if enabled."""
-        if self.use_cache and self._weight_fp16 is not None:
-            return self._weight_fp16
+        """Get weight in compute_dtype, using cache if enabled."""
+        if self.use_cache and self._weight_cache is not None:
+            return self._weight_cache
 
-        # Dequantize
-        weight_fp16 = dequantize_rowwise(self.weight_int8, self.weight_scales)
+        # Dequantize to compute_dtype
+        weight = dequantize_rowwise(self.weight_int8, self.weight_scales, dtype=self.compute_dtype)
 
         if self.use_cache:
-            self._weight_fp16 = weight_fp16
+            self._weight_cache = weight
 
-        return weight_fp16
+        return weight
 
     def clear_cache(self):
         """Clear the weight cache to free memory."""
-        self._weight_fp16 = None
+        self._weight_cache = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Get fp16 weight (cached or dequantized)
-        weight_fp16 = self._get_weight()
+        # Get weight in compute_dtype (cached or dequantized)
+        weight = self._get_weight()
 
-        # Fast fp16 matmul (AMX accelerated on Apple Silicon)
-        return torch.nn.functional.linear(x, weight_fp16, self.bias)
+        # Fast matmul (AMX accelerated on Apple Silicon)
+        return torch.nn.functional.linear(x, weight, self.bias)
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, device=None, use_cache: bool = True) -> 'Linear8bit':
+    def from_linear(cls, linear: nn.Linear, device=None, use_cache: bool = True, compute_dtype: torch.dtype = None) -> 'Linear8bit':
         """
         Convert a regular linear layer to 8-bit.
 
@@ -150,6 +154,7 @@ class Linear8bit(nn.Module):
             linear: Source nn.Linear layer
             device: Target device (default: same as source)
             use_cache: Cache dequantized weights for speed
+            compute_dtype: Dtype for dequantized weights (default: infer from input, fallback to fp16)
 
         Returns:
             Linear8bit layer with quantized weights
@@ -157,22 +162,30 @@ class Linear8bit(nn.Module):
         if device is None:
             device = linear.weight.device
 
+        # Infer compute_dtype from source if not specified
+        if compute_dtype is None:
+            if linear.weight.dtype == torch.bfloat16:
+                compute_dtype = torch.bfloat16
+            else:
+                compute_dtype = torch.float16
+
         layer = cls(
             linear.in_features,
             linear.out_features,
             bias=linear.bias is not None,
             device=device,
             use_cache=use_cache,
+            compute_dtype=compute_dtype,
         )
 
         # Quantize weights
         weight_int8, weight_scales = quantize_rowwise(linear.weight.data.to(device))
         layer.weight_int8.copy_(weight_int8)
-        layer.weight_scales.copy_(weight_scales.to(torch.float16))
+        layer.weight_scales.copy_(weight_scales.to(torch.float32))
 
         # Copy bias
         if linear.bias is not None:
-            layer.bias.data.copy_(linear.bias.data.to(torch.float16).to(device))
+            layer.bias.data.copy_(linear.bias.data.to(compute_dtype).to(device))
 
         return layer
 
@@ -180,13 +193,15 @@ class Linear8bit(nn.Module):
         return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}'
 
 
-def quantize_model(model: nn.Module, device='mps') -> nn.Module:
+def quantize_model(model: nn.Module, device='mps', compute_dtype: torch.dtype = None) -> nn.Module:
     """
     Convert all Linear layers in a model to 8-bit.
 
     Args:
         model: PyTorch model
         device: Target device
+        compute_dtype: Dtype for dequantized weights (torch.float16 or torch.bfloat16)
+                       If None, infers from each layer's weight dtype
 
     Returns:
         Model with Linear layers replaced by Linear8bit
@@ -194,10 +209,10 @@ def quantize_model(model: nn.Module, device='mps') -> nn.Module:
     for name, module in model.named_children():
         if isinstance(module, nn.Linear):
             # Replace with 8-bit version
-            setattr(model, name, Linear8bit.from_linear(module, device=device))
+            setattr(model, name, Linear8bit.from_linear(module, device=device, compute_dtype=compute_dtype))
         else:
             # Recurse
-            quantize_model(module, device=device)
+            quantize_model(module, device=device, compute_dtype=compute_dtype)
 
     return model
 
