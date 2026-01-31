@@ -1147,7 +1147,8 @@ at::Tensor matmul_int8_mps(
     auto B_s = B_scales.to(at::kFloat).contiguous();
     auto A_c = A.contiguous();
     auto B_c = B.contiguous();
-    auto output = at::empty({M, N}, A.options().dtype(out_dtype));
+    // Kernels always output fp16, we convert to requested dtype at the end
+    auto output_fp16 = at::empty({M, N}, A.options().dtype(at::kHalf));
 
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
@@ -1157,7 +1158,7 @@ at::Tensor matmul_int8_mps(
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(A_c) offset:0 atIndex:0];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(B_c) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output_fp16) offset:0 atIndex:2];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(A_s) offset:0 atIndex:3];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(B_s) offset:0 atIndex:4];
 
@@ -1171,7 +1172,8 @@ at::Tensor matmul_int8_mps(
         [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
     }
 
-    return output;
+    // Convert to requested output dtype
+    return (out_dtype == at::kHalf) ? output_fp16 : output_fp16.to(out_dtype);
 }
 
 // INT8 linear layer: half input @ int8 weight (with row-wise scales)
@@ -1190,7 +1192,8 @@ at::Tensor linear_int8_mps(const at::Tensor& input, const at::Tensor& weight,
 
     bool has_bias = bias.has_value();
     auto bias_c = has_bias ? bias.value().to(at::kHalf).contiguous() : at::empty({1}, input.options().dtype(at::kHalf));
-    auto output = at::empty({M, N}, input.options().dtype(dtype));
+    // Kernels always output fp16, we convert to requested dtype at the end
+    auto output_fp16 = at::empty({M, N}, input.options().dtype(at::kHalf));
 
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
@@ -1205,7 +1208,7 @@ at::Tensor linear_int8_mps(const at::Tensor& input, const at::Tensor& weight,
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:0 atIndex:1];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(scales_c) offset:0 atIndex:2];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(bias_c) offset:0 atIndex:3];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output_fp16) offset:0 atIndex:4];
 
         uint32_t params[4] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, has_bias ? 1u : 0u};
         for (int i = 0; i < 4; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
@@ -1221,6 +1224,8 @@ at::Tensor linear_int8_mps(const at::Tensor& input, const at::Tensor& weight,
         }
     }
 
+    // Convert to requested output dtype
+    auto output = (dtype == at::kHalf) ? output_fp16 : output_fp16.to(dtype);
     return is_1d ? output.squeeze(0) : output;
 }
 
@@ -1310,7 +1315,8 @@ at::Tensor matmul_nf4_mps(const at::Tensor& input, const at::Tensor& weight_pack
 
     bool has_bias = bias.has_value();
     auto bias_c = has_bias ? bias.value().to(at::kHalf).contiguous() : at::empty({1}, input.options().dtype(at::kHalf));
-    auto output = at::empty({M, N}, input.options().dtype(dtype));
+    // Kernels always output fp16, we convert to requested dtype at the end
+    auto output_fp16 = at::empty({M, N}, input.options().dtype(at::kHalf));
 
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
@@ -1332,7 +1338,7 @@ at::Tensor matmul_nf4_mps(const at::Tensor& input, const at::Tensor& weight_pack
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:0 atIndex:1];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(absmax_c) offset:0 atIndex:2];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(bias_c) offset:0 atIndex:3];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output_fp16) offset:0 atIndex:4];
 
         uint32_t params[6] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)K_weight, (uint32_t)block_size, has_bias ? 1u : 0u};
         for (int i = 0; i < 6; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
@@ -1354,6 +1360,8 @@ at::Tensor matmul_nf4_mps(const at::Tensor& input, const at::Tensor& weight_pack
         }
     }
 
+    // Convert to requested output dtype
+    auto output = (dtype == at::kHalf) ? output_fp16 : output_fp16.to(dtype);
     return is_1d ? output.squeeze(0) : output;
 }
 
@@ -1438,7 +1446,8 @@ at::Tensor matmul_fp4_mps(const at::Tensor& input, const at::Tensor& weight_pack
 
     bool has_bias = bias.has_value();
     auto bias_c = has_bias ? bias.value().to(at::kHalf).contiguous() : at::empty({1}, input.options().dtype(at::kHalf));
-    auto output = at::empty({M, N}, input.options().dtype(dtype));
+    // Kernels always output fp16, we convert to requested dtype at the end
+    auto output_fp16 = at::empty({M, N}, input.options().dtype(at::kHalf));
 
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
@@ -1454,7 +1463,7 @@ at::Tensor matmul_fp4_mps(const at::Tensor& input, const at::Tensor& weight_pack
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:0 atIndex:1];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(absmax_c) offset:0 atIndex:2];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(bias_c) offset:0 atIndex:3];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output_fp16) offset:0 atIndex:4];
 
         uint32_t params[6] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)K_weight, (uint32_t)block_size, has_bias ? 1u : 0u};
         for (int i = 0; i < 6; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
@@ -1470,6 +1479,8 @@ at::Tensor matmul_fp4_mps(const at::Tensor& input, const at::Tensor& weight_pack
         }
     }
 
+    // Convert to requested output dtype
+    auto output = (dtype == at::kHalf) ? output_fp16 : output_fp16.to(dtype);
     return is_1d ? output.squeeze(0) : output;
 }
 
@@ -1549,7 +1560,8 @@ at::Tensor matmul_fp8_e4m3_mps(const at::Tensor& input, const at::Tensor& weight
 
     bool has_bias = bias.has_value();
     auto bias_c = has_bias ? bias.value().to(at::kHalf).contiguous() : at::empty({1}, input.options().dtype(at::kHalf));
-    auto output = at::empty({M, N}, input.options().dtype(dtype));
+    // Kernels always output fp16, we convert to requested dtype at the end
+    auto output_fp16 = at::empty({M, N}, input.options().dtype(at::kHalf));
 
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
@@ -1565,7 +1577,7 @@ at::Tensor matmul_fp8_e4m3_mps(const at::Tensor& input, const at::Tensor& weight
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:0 atIndex:1];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(scales_c) offset:0 atIndex:2];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(bias_c) offset:0 atIndex:3];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output_fp16) offset:0 atIndex:4];
 
         uint32_t params[4] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, has_bias ? 1u : 0u};
         for (int i = 0; i < 4; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
@@ -1581,6 +1593,8 @@ at::Tensor matmul_fp8_e4m3_mps(const at::Tensor& input, const at::Tensor& weight
         }
     }
 
+    // Convert to requested output dtype
+    auto output = (dtype == at::kHalf) ? output_fp16 : output_fp16.to(dtype);
     return is_1d ? output.squeeze(0) : output;
 }
 
