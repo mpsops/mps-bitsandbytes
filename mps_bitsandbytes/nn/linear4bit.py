@@ -218,6 +218,14 @@ class Linear4bit(nn.Module):
         """
         return self.weight.device
 
+    def _apply(self, fn):
+        """Override _apply to also move quant_state when .to() is called."""
+        super()._apply(fn)
+        # Move quant_state tensors (absmax, code, etc.) to same device
+        if self.weight_quant_state is not None:
+            self.weight_quant_state.to(self.weight.device)
+        return self
+
     def extra_repr(self) -> str:
         return (
             f'in_features={self.in_features}, out_features={self.out_features}, '
