@@ -543,6 +543,8 @@ def matmul_4bit(
     """
     Matrix multiplication with 4-bit quantized weights.
 
+    Uses fused Metal kernel when available for ~2x speedup.
+
     Args:
         A: Input tensor [..., in_features]
         B: Quantized weight tensor (packed uint8)
@@ -552,7 +554,51 @@ def matmul_4bit(
     Returns:
         Output tensor [..., out_features]
     """
-    # Dequantize weights
+    # Try native fused kernel
+    _C = _try_load_native()
+    if _C is not None and A.device.type == 'mps' and B.device.type == 'mps':
+        # Reshape input for matmul if needed
+        orig_shape = A.shape
+        if A.dim() > 2:
+            A_2d = A.view(-1, A.shape[-1])
+        else:
+            A_2d = A
+
+        # For large batch sizes (M > 256), the tiled kernel is slower than
+        # dequantize+matmul due to per-element dequantization overhead.
+        # Fall back to unfused path in this case.
+        M = A_2d.shape[0]
+        if M > 256:
+            # Use unfused path below
+            pass
+        else:
+            # Handle double quantization - dequantize absmax first
+            absmax = quant_state.absmax
+            if quant_state.state2 is not None:
+                absmax = dequantize_blockwise(absmax, quant_state.state2)
+
+            # Get dimensions from quant_state.shape (original weight shape)
+            out_features, in_features = quant_state.shape[0], quant_state.shape[1]
+
+            # Reshape weight from flat to [N, K/2]
+            weight_2d = B.view(out_features, in_features // 2)
+
+            # Reshape absmax to [N, num_blocks_per_row]
+            num_blocks_per_row = (in_features + quant_state.blocksize - 1) // quant_state.blocksize
+            absmax_2d = absmax.view(out_features, num_blocks_per_row)
+
+            # Call native fused kernel (NF4 or FP4)
+            if quant_state.quant_type == "nf4":
+                output = _C.matmul_nf4(A_2d, weight_2d, absmax_2d, bias, quant_state.blocksize, A_2d.dtype)
+            else:  # fp4
+                output = _C.matmul_fp4(A_2d, weight_2d, absmax_2d, bias, quant_state.blocksize, A_2d.dtype)
+
+            if len(orig_shape) > 2:
+                output = output.view(*orig_shape[:-1], -1)
+
+            return output
+
+    # Python fallback: Dequantize weights then matmul
     weight = dequantize_4bit(B, quant_state)
 
     # Reshape for matmul if needed
