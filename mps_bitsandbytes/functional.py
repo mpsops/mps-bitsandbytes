@@ -139,6 +139,10 @@ def quantize_4bit(
     """
     Quantize tensor to 4-bit NF4 or FP4 format.
 
+    For 2D weight tensors [N, K], quantization is done row-wise:
+    each row is quantized independently with its own absmax blocks.
+    This allows efficient fused matmul kernels.
+
     Args:
         A: Input tensor (any shape, will be flattened internally)
         absmax: Optional pre-allocated absmax tensor
@@ -158,42 +162,79 @@ def quantize_4bit(
     orig_dtype = A.dtype
     A = A.contiguous()
 
-    # Flatten to 2D for processing
-    numel = A.numel()
-    # Pad to be divisible by blocksize * 2 (for packing)
-    padded_numel = ((numel + blocksize - 1) // blocksize) * blocksize
-    if padded_numel % 2 != 0:
-        padded_numel += blocksize
+    # For 2D tensors (weight matrices), use row-wise quantization
+    # This enables efficient fused matmul kernels
+    if A.dim() == 2:
+        N, K = A.shape
+        # Pad K to be divisible by blocksize
+        K_padded = ((K + blocksize - 1) // blocksize) * blocksize
+        if K_padded % 2 != 0:
+            K_padded += blocksize
 
-    A_flat = torch.zeros(padded_numel, dtype=A.dtype, device=A.device)
-    A_flat[:numel] = A.flatten()
+        A_padded = torch.zeros(N, K_padded, dtype=A.dtype, device=A.device)
+        A_padded[:, :K] = A
 
-    # Reshape to [num_blocks, blocksize]
-    num_blocks = padded_numel // blocksize
-    A_blocked = A_flat.view(num_blocks, blocksize)
+        # Reshape to [N, num_blocks_per_row, blocksize]
+        num_blocks_per_row = K_padded // blocksize
+        A_blocked = A_padded.view(N, num_blocks_per_row, blocksize)
 
-    # Compute absmax per block
-    if absmax is None:
-        absmax = A_blocked.float().abs().max(dim=1).values.clamp(min=1e-8)
+        # Compute absmax per block (row-wise)
+        if absmax is None:
+            absmax = A_blocked.float().abs().max(dim=2).values.clamp(min=1e-8)
+            # absmax shape: [N, num_blocks_per_row]
 
-    # Normalize and quantize
-    codebook = NF4_CODEBOOK if quant_type == "nf4" else FP4_CODEBOOK
-    codebook = codebook.to(A.device)
+        # Normalize and quantize
+        codebook = NF4_CODEBOOK if quant_type == "nf4" else FP4_CODEBOOK
+        codebook = codebook.to(A.device)
 
-    A_norm = A_blocked.float() / absmax.unsqueeze(1)
+        A_norm = A_blocked.float() / absmax.unsqueeze(-1)
 
-    # Find nearest codebook entry
-    # [num_blocks, blocksize, 1] vs [1, 1, 16]
-    diffs = (A_norm.unsqueeze(-1) - codebook.view(1, 1, -1)).abs()
-    indices = diffs.argmin(dim=-1).to(torch.uint8)  # [num_blocks, blocksize]
+        # Find nearest codebook entry
+        diffs = (A_norm.unsqueeze(-1) - codebook.view(1, 1, 1, -1)).abs()
+        indices = diffs.argmin(dim=-1).to(torch.uint8)  # [N, num_blocks_per_row, blocksize]
 
-    # Pack two 4-bit values per byte
-    indices_flat = indices.flatten()
-    packed_numel = padded_numel // 2
-    if out is None:
-        out = torch.zeros(packed_numel, dtype=quant_storage, device=A.device)
+        # Pack two 4-bit values per byte
+        indices_flat = indices.view(N, -1)  # [N, K_padded]
+        packed_K = K_padded // 2
+        if out is None:
+            out = torch.zeros(N, packed_K, dtype=quant_storage, device=A.device)
 
-    out[:] = (indices_flat[0::2] | (indices_flat[1::2] << 4)).to(quant_storage)
+        out[:] = (indices_flat[:, 0::2] | (indices_flat[:, 1::2] << 4)).to(quant_storage)
+        out = out.flatten()
+
+        # Flatten absmax for storage
+        absmax = absmax.flatten()
+
+    else:
+        # For non-2D tensors, use flat quantization (original behavior)
+        numel = A.numel()
+        padded_numel = ((numel + blocksize - 1) // blocksize) * blocksize
+        if padded_numel % 2 != 0:
+            padded_numel += blocksize
+
+        A_flat = torch.zeros(padded_numel, dtype=A.dtype, device=A.device)
+        A_flat[:numel] = A.flatten()
+
+        num_blocks = padded_numel // blocksize
+        A_blocked = A_flat.view(num_blocks, blocksize)
+
+        if absmax is None:
+            absmax = A_blocked.float().abs().max(dim=1).values.clamp(min=1e-8)
+
+        codebook = NF4_CODEBOOK if quant_type == "nf4" else FP4_CODEBOOK
+        codebook = codebook.to(A.device)
+
+        A_norm = A_blocked.float() / absmax.unsqueeze(1)
+
+        diffs = (A_norm.unsqueeze(-1) - codebook.view(1, 1, -1)).abs()
+        indices = diffs.argmin(dim=-1).to(torch.uint8)
+
+        indices_flat = indices.flatten()
+        packed_numel = padded_numel // 2
+        if out is None:
+            out = torch.zeros(packed_numel, dtype=quant_storage, device=A.device)
+
+        out[:] = (indices_flat[0::2] | (indices_flat[1::2] << 4)).to(quant_storage)
 
     # Double quantization
     state2 = None
@@ -254,6 +295,48 @@ def dequantize_4bit(
     codebook = NF4_CODEBOOK if quant_type == "nf4" else FP4_CODEBOOK
     codebook = codebook.to(A.device)
 
+    # For 2D weight matrices, use row-wise dequantization
+    if shape is not None and len(shape) == 2:
+        N, K = shape
+        K_padded = ((K + blocksize - 1) // blocksize) * blocksize
+        if K_padded % 2 != 0:
+            K_padded += blocksize
+        num_blocks_per_row = K_padded // blocksize
+
+        # Reshape packed data to [N, K_padded/2]
+        packed_K = K_padded // 2
+        A_2d = A.view(N, packed_K)
+
+        # Unpack
+        low = (A_2d & 0x0F).long()
+        high = ((A_2d >> 4) & 0x0F).long()
+
+        # Interleave to get [N, K_padded]
+        unpacked = torch.zeros(N, K_padded, dtype=torch.long, device=A.device)
+        unpacked[:, 0::2] = low
+        unpacked[:, 1::2] = high
+
+        # Reshape to [N, num_blocks_per_row, blocksize]
+        unpacked = unpacked.view(N, num_blocks_per_row, blocksize)
+
+        # Reshape absmax to [N, num_blocks_per_row]
+        absmax_2d = absmax.view(N, num_blocks_per_row)
+
+        # Dequantize
+        values = codebook[unpacked]  # [N, num_blocks_per_row, blocksize]
+        values = values * absmax_2d.unsqueeze(-1)
+
+        # Reshape to [N, K]
+        values = values.view(N, K_padded)[:, :K]
+
+        if out is None:
+            out = values.to(dtype)
+        else:
+            out[:] = values.to(dtype)
+
+        return out
+
+    # For non-2D tensors, use flat dequantization (original behavior)
     # Unpack
     low = (A & 0x0F).long()
     high = ((A >> 4) & 0x0F).long()
@@ -579,19 +662,26 @@ def matmul_4bit(
 
             # Get dimensions from quant_state.shape (original weight shape)
             out_features, in_features = quant_state.shape[0], quant_state.shape[1]
+            blocksize = quant_state.blocksize
 
-            # Reshape weight from flat to [N, K/2]
-            weight_2d = B.view(out_features, in_features // 2)
+            # Compute K_padded (matching quantize_4bit logic for 2D tensors)
+            K_padded = ((in_features + blocksize - 1) // blocksize) * blocksize
+            if K_padded % 2 != 0:
+                K_padded += blocksize
+
+            # Reshape weight from flat to [N, K_padded/2]
+            packed_K = K_padded // 2
+            weight_2d = B.view(out_features, packed_K)
 
             # Reshape absmax to [N, num_blocks_per_row]
-            num_blocks_per_row = (in_features + quant_state.blocksize - 1) // quant_state.blocksize
+            num_blocks_per_row = K_padded // blocksize
             absmax_2d = absmax.view(out_features, num_blocks_per_row)
 
             # Call native fused kernel (NF4 or FP4)
             if quant_state.quant_type == "nf4":
-                output = _C.matmul_nf4(A_2d, weight_2d, absmax_2d, bias, quant_state.blocksize, A_2d.dtype)
+                output = _C.matmul_nf4(A_2d, weight_2d, absmax_2d, bias, blocksize, A_2d.dtype)
             else:  # fp4
-                output = _C.matmul_fp4(A_2d, weight_2d, absmax_2d, bias, quant_state.blocksize, A_2d.dtype)
+                output = _C.matmul_fp4(A_2d, weight_2d, absmax_2d, bias, blocksize, A_2d.dtype)
 
             if len(orig_shape) > 2:
                 output = output.view(*orig_shape[:-1], -1)

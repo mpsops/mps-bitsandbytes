@@ -171,6 +171,111 @@ kernel void int8_matmul_dequant(
 }
 
 // =============================================================================
+// INT8 MatMul with SIMD Group Matrix Operations (Apple Silicon optimized)
+// Weight layout: [N, K] with row-wise scales[N]
+// =============================================================================
+
+kernel void int8_matmul_simd(
+    device const half* input [[buffer(0)]],       // [M, K] half
+    device const char* weight [[buffer(1)]],      // [N, K] int8
+    device const float* weight_scales [[buffer(2)]], // [N] per-row scales
+    device const half* bias [[buffer(3)]],        // [N]
+    device half* output [[buffer(4)]],            // [M, N]
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& has_bias [[buffer(8)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    uint out_row_base = tgid.y * 8;
+    uint out_col_base = tgid.x * 8;
+
+    threadgroup half A_tile[8][8];
+    threadgroup half B_tile[8][8];
+
+    simdgroup_matrix<float, 8, 8> C;
+    C = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k_base = 0; k_base < K; k_base += 8) {
+        // Load A tile
+        {
+            uint idx0 = simd_lane_id * 2;
+            uint idx1 = simd_lane_id * 2 + 1;
+
+            uint r0 = idx0 / 8, c0 = idx0 % 8;
+            uint r1 = idx1 / 8, c1 = idx1 % 8;
+
+            uint gr0 = out_row_base + r0, gc0 = k_base + c0;
+            uint gr1 = out_row_base + r1, gc1 = k_base + c1;
+
+            A_tile[r0][c0] = (gr0 < M && gc0 < K) ? input[gr0 * K + gc0] : half(0);
+            A_tile[r1][c1] = (gr1 < M && gc1 < K) ? input[gr1 * K + gc1] : half(0);
+        }
+
+        // Load + dequantize B tile (INT8)
+        {
+            uint idx0 = simd_lane_id * 2;
+            uint idx1 = simd_lane_id * 2 + 1;
+
+            uint k0 = idx0 / 8, n0 = idx0 % 8;
+            uint k1 = idx1 / 8, n1 = idx1 % 8;
+
+            uint gk0 = k_base + k0, gn0 = out_col_base + n0;
+            uint gk1 = k_base + k1, gn1 = out_col_base + n1;
+
+            if (gk0 < K && gn0 < N) {
+                float scale = weight_scales[gn0];
+                B_tile[k0][n0] = half(float(weight[gn0 * K + gk0]) * scale / 127.0f);
+            } else {
+                B_tile[k0][n0] = half(0);
+            }
+
+            if (gk1 < K && gn1 < N) {
+                float scale = weight_scales[gn1];
+                B_tile[k1][n1] = half(float(weight[gn1 * K + gk1]) * scale / 127.0f);
+            } else {
+                B_tile[k1][n1] = half(0);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<half, 8, 8> A_mat, B_mat;
+        simdgroup_load(A_mat, &A_tile[0][0], 8);
+        simdgroup_load(B_mat, &B_tile[0][0], 8);
+        simdgroup_multiply_accumulate(C, A_mat, B_mat, C);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store result
+    threadgroup float C_tile[8][8];
+    simdgroup_store(C, &C_tile[0][0], 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = simd_lane_id * 2; idx < 64; idx += 64) {
+        uint r0 = idx / 8, c0 = idx % 8;
+        uint r1 = (idx + 1) / 8, c1 = (idx + 1) % 8;
+
+        uint gr0 = out_row_base + r0, gc0 = out_col_base + c0;
+        uint gr1 = out_row_base + r1, gc1 = out_col_base + c1;
+
+        if (gr0 < M && gc0 < N) {
+            float v = C_tile[r0][c0];
+            if (has_bias) v += float(bias[gc0]);
+            output[gr0 * N + gc0] = half(v);
+        }
+        if (gr1 < M && gc1 < N) {
+            float v = C_tile[r1][c1];
+            if (has_bias) v += float(bias[gc1]);
+            output[gr1 * N + gc1] = half(v);
+        }
+    }
+}
+
+// =============================================================================
 // NF4 Kernels
 // =============================================================================
 
@@ -265,20 +370,21 @@ kernel void nf4_linear_simple(
     constant uint& M [[buffer(5)]],
     constant uint& N [[buffer(6)]],
     constant uint& K [[buffer(7)]],
-    constant uint& block_size [[buffer(8)]],
-    constant uint& has_bias [[buffer(9)]],
+    constant uint& K_weight [[buffer(8)]],
+    constant uint& block_size [[buffer(9)]],
+    constant uint& has_bias [[buffer(10)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint m = gid.y, n = gid.x;
     if (m >= M || n >= N) return;
 
-    uint num_blocks = (K + block_size - 1) / block_size;
+    uint num_blocks = K_weight / block_size;
     float acc = 0.0f;
 
     for (uint k = 0; k < K; k++) {
         float in_val = float(input[m * K + k]);
         float scale = absmax[n * num_blocks + k / block_size];
-        float w_val = dequant_nf4(weight[n * (K/2) + k/2], k % 2, scale);
+        float w_val = dequant_nf4(weight[n * (K_weight/2) + k/2], k % 2, scale);
         acc += in_val * w_val;
     }
 
@@ -299,17 +405,19 @@ constant uint TILE_K = 64;
 // =============================================================================
 
 // Simple version: one simdgroup handles one 8x8 output tile
+// K = input dimension (original), K_weight = weight dimension (may be padded)
 kernel void nf4_matmul_simd(
     device const half* input [[buffer(0)]],       // [M, K]
-    device const uchar* weight [[buffer(1)]],     // [N, K/2] packed
+    device const uchar* weight [[buffer(1)]],     // [N, K_weight/2] packed
     device const float* absmax [[buffer(2)]],     // [N, num_blocks]
     device const half* bias [[buffer(3)]],        // [N]
     device half* output [[buffer(4)]],            // [M, N]
     constant uint& M [[buffer(5)]],
     constant uint& N [[buffer(6)]],
-    constant uint& K [[buffer(7)]],
-    constant uint& block_size [[buffer(8)]],
-    constant uint& has_bias [[buffer(9)]],
+    constant uint& K [[buffer(7)]],               // Input K (original)
+    constant uint& K_weight [[buffer(8)]],        // Weight K (padded)
+    constant uint& block_size [[buffer(9)]],
+    constant uint& has_bias [[buffer(10)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint2 tgid [[threadgroup_position_in_grid]]
@@ -330,7 +438,7 @@ kernel void nf4_matmul_simd(
     simdgroup_matrix<float, 8, 8> C;
     C = simdgroup_matrix<float, 8, 8>(0.0f);
 
-    uint num_blocks = (K + block_size - 1) / block_size;
+    uint num_blocks = K_weight / block_size;  // Use padded K for weight blocks
 
     // Loop over K in chunks of 8
     for (uint k_base = 0; k_base < K; k_base += 8) {
@@ -363,7 +471,7 @@ kernel void nf4_matmul_simd(
 
             if (gk0 < K && gn0 < N) {
                 float scale = absmax[gn0 * num_blocks + gk0 / block_size];
-                uchar packed = weight[gn0 * (K/2) + gk0/2];
+                uchar packed = weight[gn0 * (K_weight/2) + gk0/2];
                 B_tile[k0][n0] = half(dequant_nf4(packed, gk0 % 2, scale));
             } else {
                 B_tile[k0][n0] = half(0);
@@ -371,7 +479,7 @@ kernel void nf4_matmul_simd(
 
             if (gk1 < K && gn1 < N) {
                 float scale = absmax[gn1 * num_blocks + gk1 / block_size];
-                uchar packed = weight[gn1 * (K/2) + gk1/2];
+                uchar packed = weight[gn1 * (K_weight/2) + gk1/2];
                 B_tile[k1][n1] = half(dequant_nf4(packed, gk1 % 2, scale));
             } else {
                 B_tile[k1][n1] = half(0);
@@ -425,8 +533,9 @@ kernel void nf4_matmul_fused(
     constant uint& M [[buffer(5)]],
     constant uint& N [[buffer(6)]],
     constant uint& K [[buffer(7)]],
-    constant uint& block_size [[buffer(8)]],
-    constant uint& has_bias [[buffer(9)]],
+    constant uint& K_weight [[buffer(8)]],
+    constant uint& block_size [[buffer(9)]],
+    constant uint& has_bias [[buffer(10)]],
     uint2 tid [[thread_position_in_threadgroup]],
     uint2 tgid [[threadgroup_position_in_grid]]
 ) {
@@ -439,7 +548,7 @@ kernel void nf4_matmul_fused(
     uint col_base = tgid.x * TILE_N + tx * 4;
 
     float acc[4][4] = {{0.0f}};
-    uint num_blocks = (K + block_size - 1) / block_size;
+    uint num_blocks = K_weight / block_size;
 
     for (uint t = 0; t < K; t += TILE_K) {
         for (uint i = 0; i < (TILE_M * TILE_K) / 64; i++) {
@@ -455,7 +564,7 @@ kernel void nf4_matmul_fused(
             uint gk = t + lk, gn = tgid.x * TILE_N + ln;
             if (gk < K && gn < N) {
                 float scale = absmax[gn * num_blocks + gk / block_size];
-                Bs[lk][ln] = half(dequant_nf4(weight[gn * (K/2) + gk/2], gk % 2, scale));
+                Bs[lk][ln] = half(dequant_nf4(weight[gn * (K_weight/2) + gk/2], gk % 2, scale));
             } else {
                 Bs[lk][ln] = half(0);
             }
@@ -583,25 +692,136 @@ kernel void fp4_linear_simple(
     constant uint& M [[buffer(5)]],
     constant uint& N [[buffer(6)]],
     constant uint& K [[buffer(7)]],
-    constant uint& block_size [[buffer(8)]],
-    constant uint& has_bias [[buffer(9)]],
+    constant uint& K_weight [[buffer(8)]],
+    constant uint& block_size [[buffer(9)]],
+    constant uint& has_bias [[buffer(10)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint m = gid.y, n = gid.x;
     if (m >= M || n >= N) return;
 
-    uint num_blocks = (K + block_size - 1) / block_size;
+    uint num_blocks = K_weight / block_size;
     float acc = 0.0f;
 
     for (uint k = 0; k < K; k++) {
         float in_val = float(input[m * K + k]);
         float scale = absmax[n * num_blocks + k / block_size];
-        float w_val = dequant_fp4(weight[n * (K/2) + k/2], k % 2, scale);
+        float w_val = dequant_fp4(weight[n * (K_weight/2) + k/2], k % 2, scale);
         acc += in_val * w_val;
     }
 
     if (has_bias) acc += float(bias[n]);
     output[m * N + n] = half(acc);
+}
+
+// =============================================================================
+// FP4 MatMul with SIMD Group Matrix Operations (Apple Silicon optimized)
+// =============================================================================
+
+kernel void fp4_matmul_simd(
+    device const half* input [[buffer(0)]],       // [M, K]
+    device const uchar* weight [[buffer(1)]],     // [N, K_weight/2] packed
+    device const float* absmax [[buffer(2)]],     // [N, num_blocks]
+    device const half* bias [[buffer(3)]],        // [N]
+    device half* output [[buffer(4)]],            // [M, N]
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& K_weight [[buffer(8)]],
+    constant uint& block_size [[buffer(9)]],
+    constant uint& has_bias [[buffer(10)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    uint out_row_base = tgid.y * 8;
+    uint out_col_base = tgid.x * 8;
+
+    threadgroup half A_tile[8][8];
+    threadgroup half B_tile[8][8];
+
+    simdgroup_matrix<float, 8, 8> C;
+    C = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint num_blocks = K_weight / block_size;
+
+    for (uint k_base = 0; k_base < K; k_base += 8) {
+        // Load A tile
+        {
+            uint idx0 = simd_lane_id * 2;
+            uint idx1 = simd_lane_id * 2 + 1;
+
+            uint r0 = idx0 / 8, c0 = idx0 % 8;
+            uint r1 = idx1 / 8, c1 = idx1 % 8;
+
+            uint gr0 = out_row_base + r0, gc0 = k_base + c0;
+            uint gr1 = out_row_base + r1, gc1 = k_base + c1;
+
+            A_tile[r0][c0] = (gr0 < M && gc0 < K) ? input[gr0 * K + gc0] : half(0);
+            A_tile[r1][c1] = (gr1 < M && gc1 < K) ? input[gr1 * K + gc1] : half(0);
+        }
+
+        // Load + dequantize B tile (FP4)
+        {
+            uint idx0 = simd_lane_id * 2;
+            uint idx1 = simd_lane_id * 2 + 1;
+
+            uint k0 = idx0 / 8, n0 = idx0 % 8;
+            uint k1 = idx1 / 8, n1 = idx1 % 8;
+
+            uint gk0 = k_base + k0, gn0 = out_col_base + n0;
+            uint gk1 = k_base + k1, gn1 = out_col_base + n1;
+
+            if (gk0 < K && gn0 < N) {
+                float scale = absmax[gn0 * num_blocks + gk0 / block_size];
+                uchar packed = weight[gn0 * (K_weight/2) + gk0/2];
+                B_tile[k0][n0] = half(dequant_fp4(packed, gk0 % 2, scale));
+            } else {
+                B_tile[k0][n0] = half(0);
+            }
+
+            if (gk1 < K && gn1 < N) {
+                float scale = absmax[gn1 * num_blocks + gk1 / block_size];
+                uchar packed = weight[gn1 * (K_weight/2) + gk1/2];
+                B_tile[k1][n1] = half(dequant_fp4(packed, gk1 % 2, scale));
+            } else {
+                B_tile[k1][n1] = half(0);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<half, 8, 8> A_mat, B_mat;
+        simdgroup_load(A_mat, &A_tile[0][0], 8);
+        simdgroup_load(B_mat, &B_tile[0][0], 8);
+        simdgroup_multiply_accumulate(C, A_mat, B_mat, C);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store result
+    threadgroup float C_tile[8][8];
+    simdgroup_store(C, &C_tile[0][0], 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = simd_lane_id * 2; idx < 64; idx += 64) {
+        uint r0 = idx / 8, c0 = idx % 8;
+        uint r1 = (idx + 1) / 8, c1 = (idx + 1) % 8;
+
+        uint gr0 = out_row_base + r0, gc0 = out_col_base + c0;
+        uint gr1 = out_row_base + r1, gc1 = out_col_base + c1;
+
+        if (gr0 < M && gc0 < N) {
+            float v = C_tile[r0][c0];
+            if (has_bias) v += float(bias[gc0]);
+            output[gr0 * N + gc0] = half(v);
+        }
+        if (gr1 < M && gc1 < N) {
+            float v = C_tile[r1][c1];
+            if (has_bias) v += float(bias[gc1]);
+            output[gr1 * N + gc1] = half(v);
+        }
+    }
 }
 
 // =============================================================================
@@ -691,6 +911,110 @@ kernel void fp8_e4m3_linear(
 
     if (has_bias) acc += float(bias[n]);
     output[m * N + n] = half(acc);
+}
+
+// =============================================================================
+// FP8 MatMul with SIMD Group Matrix Operations (Apple Silicon optimized)
+// =============================================================================
+
+kernel void fp8_matmul_simd(
+    device const half* input [[buffer(0)]],       // [M, K]
+    device const uchar* weight [[buffer(1)]],     // [N, K] FP8 packed
+    device const float* scales [[buffer(2)]],     // [N] per-row scales
+    device const half* bias [[buffer(3)]],        // [N]
+    device half* output [[buffer(4)]],            // [M, N]
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& has_bias [[buffer(8)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    uint out_row_base = tgid.y * 8;
+    uint out_col_base = tgid.x * 8;
+
+    threadgroup half A_tile[8][8];
+    threadgroup half B_tile[8][8];
+
+    simdgroup_matrix<float, 8, 8> C;
+    C = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k_base = 0; k_base < K; k_base += 8) {
+        // Load A tile
+        {
+            uint idx0 = simd_lane_id * 2;
+            uint idx1 = simd_lane_id * 2 + 1;
+
+            uint r0 = idx0 / 8, c0 = idx0 % 8;
+            uint r1 = idx1 / 8, c1 = idx1 % 8;
+
+            uint gr0 = out_row_base + r0, gc0 = k_base + c0;
+            uint gr1 = out_row_base + r1, gc1 = k_base + c1;
+
+            A_tile[r0][c0] = (gr0 < M && gc0 < K) ? input[gr0 * K + gc0] : half(0);
+            A_tile[r1][c1] = (gr1 < M && gc1 < K) ? input[gr1 * K + gc1] : half(0);
+        }
+
+        // Load + dequantize B tile (FP8)
+        {
+            uint idx0 = simd_lane_id * 2;
+            uint idx1 = simd_lane_id * 2 + 1;
+
+            uint k0 = idx0 / 8, n0 = idx0 % 8;
+            uint k1 = idx1 / 8, n1 = idx1 % 8;
+
+            uint gk0 = k_base + k0, gn0 = out_col_base + n0;
+            uint gk1 = k_base + k1, gn1 = out_col_base + n1;
+
+            if (gk0 < K && gn0 < N) {
+                float scale = scales[gn0];
+                B_tile[k0][n0] = half(fp8_e4m3_to_float(weight[gn0 * K + gk0]) * scale);
+            } else {
+                B_tile[k0][n0] = half(0);
+            }
+
+            if (gk1 < K && gn1 < N) {
+                float scale = scales[gn1];
+                B_tile[k1][n1] = half(fp8_e4m3_to_float(weight[gn1 * K + gk1]) * scale);
+            } else {
+                B_tile[k1][n1] = half(0);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<half, 8, 8> A_mat, B_mat;
+        simdgroup_load(A_mat, &A_tile[0][0], 8);
+        simdgroup_load(B_mat, &B_tile[0][0], 8);
+        simdgroup_multiply_accumulate(C, A_mat, B_mat, C);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store result
+    threadgroup float C_tile[8][8];
+    simdgroup_store(C, &C_tile[0][0], 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = simd_lane_id * 2; idx < 64; idx += 64) {
+        uint r0 = idx / 8, c0 = idx % 8;
+        uint r1 = (idx + 1) / 8, c1 = (idx + 1) % 8;
+
+        uint gr0 = out_row_base + r0, gc0 = out_col_base + c0;
+        uint gr1 = out_row_base + r1, gc1 = out_col_base + c1;
+
+        if (gr0 < M && gc0 < N) {
+            float v = C_tile[r0][c0];
+            if (has_bias) v += float(bias[gc0]);
+            output[gr0 * N + gc0] = half(v);
+        }
+        if (gr1 < M && gc1 < N) {
+            float v = C_tile[r1][c1];
+            if (has_bias) v += float(bias[gc1]);
+            output[gr1 * N + gc1] = half(v);
+        }
+    }
 }
 
 // =============================================================================
@@ -850,6 +1174,56 @@ at::Tensor matmul_int8_mps(
     return output;
 }
 
+// INT8 linear layer: half input @ int8 weight (with row-wise scales)
+at::Tensor linear_int8_mps(const at::Tensor& input, const at::Tensor& weight,
+                           const at::Tensor& weight_scales, const std::optional<at::Tensor>& bias,
+                           at::ScalarType dtype) {
+    bool is_1d = input.dim() == 1;
+    auto input_2d = is_1d ? input.unsqueeze(0) : input;
+
+    const int64_t M = input_2d.size(0), K = input_2d.size(1), N = weight.size(0);
+    TORCH_CHECK(weight.size(1) == K, "Weight K mismatch");
+
+    auto input_c = input_2d.to(at::kHalf).contiguous();
+    auto weight_c = weight.contiguous();
+    auto scales_c = weight_scales.to(at::kFloat).contiguous();
+
+    bool has_bias = bias.has_value();
+    auto bias_c = has_bias ? bias.value().to(at::kHalf).contiguous() : at::empty({1}, input.options().dtype(at::kHalf));
+    auto output = at::empty({M, N}, input.options().dtype(dtype));
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+
+        // Use SIMD kernel for small batches (M <= 128)
+        bool use_simd = (M <= 128 && N >= 8 && K >= 8);
+        auto pipeline = get_pipeline(use_simd ? "int8_matmul_simd" : "int8_matmul_dequant");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(input_c) offset:0 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:0 atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(scales_c) offset:0 atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(bias_c) offset:0 atIndex:3];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
+
+        uint32_t params[4] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, has_bias ? 1u : 0u};
+        for (int i = 0; i < 4; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
+
+        if (use_simd) {
+            MTLSize tg = MTLSizeMake(32, 1, 1);
+            MTLSize ntg = MTLSizeMake((N + 7) / 8, (M + 7) / 8, 1);
+            [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+        } else {
+            MTLSize tg = MTLSizeMake(16, 16, 1);
+            MTLSize grid = MTLSizeMake((N + 15) / 16 * 16, (M + 15) / 16 * 16, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        }
+    }
+
+    return is_1d ? output.squeeze(0) : output;
+}
+
 // =============================================================================
 // NF4 Operations
 // =============================================================================
@@ -927,7 +1301,8 @@ at::Tensor matmul_nf4_mps(const at::Tensor& input, const at::Tensor& weight_pack
     auto input_2d = is_1d ? input.unsqueeze(0) : input;
 
     const int64_t M = input_2d.size(0), K = input_2d.size(1), N = weight_packed.size(0);
-    TORCH_CHECK(weight_packed.size(1) * 2 == K, "Weight K mismatch");
+    // K_weight is the padded K dimension used for weight storage
+    const int64_t K_weight = weight_packed.size(1) * 2;
 
     auto input_c = input_2d.to(at::kHalf).contiguous();
     auto weight_c = weight_packed.contiguous();
@@ -959,8 +1334,8 @@ at::Tensor matmul_nf4_mps(const at::Tensor& input, const at::Tensor& weight_pack
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(bias_c) offset:0 atIndex:3];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
 
-        uint32_t params[5] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)block_size, has_bias ? 1u : 0u};
-        for (int i = 0; i < 5; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
+        uint32_t params[6] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)K_weight, (uint32_t)block_size, has_bias ? 1u : 0u};
+        for (int i = 0; i < 6; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
 
         if (use_simd) {
             // SIMD kernel: 32 threads (1 simdgroup) per threadgroup
@@ -1054,6 +1429,8 @@ at::Tensor matmul_fp4_mps(const at::Tensor& input, const at::Tensor& weight_pack
     auto input_2d = is_1d ? input.unsqueeze(0) : input;
 
     const int64_t M = input_2d.size(0), K = input_2d.size(1), N = weight_packed.size(0);
+    // K_weight is the padded K dimension used for weight storage
+    const int64_t K_weight = weight_packed.size(1) * 2;
 
     auto input_c = input_2d.to(at::kHalf).contiguous();
     auto weight_c = weight_packed.contiguous();
@@ -1066,7 +1443,11 @@ at::Tensor matmul_fp4_mps(const at::Tensor& input, const at::Tensor& weight_pack
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         auto encoder = stream->commandEncoder();
-        auto pipeline = get_pipeline("fp4_linear_simple");
+
+        // Use SIMD kernel for small batches (M <= 128), fallback to simple for larger
+        bool use_simd = (M <= 128 && N >= 8 && K >= 8);
+        const char* kernel_name = use_simd ? "fp4_matmul_simd" : "fp4_linear_simple";
+        auto pipeline = get_pipeline(kernel_name);
 
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(input_c) offset:0 atIndex:0];
@@ -1075,12 +1456,18 @@ at::Tensor matmul_fp4_mps(const at::Tensor& input, const at::Tensor& weight_pack
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(bias_c) offset:0 atIndex:3];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
 
-        uint32_t params[5] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)block_size, has_bias ? 1u : 0u};
-        for (int i = 0; i < 5; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
+        uint32_t params[6] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, (uint32_t)K_weight, (uint32_t)block_size, has_bias ? 1u : 0u};
+        for (int i = 0; i < 6; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
 
-        MTLSize tg = MTLSizeMake(16, 16, 1);
-        MTLSize grid = MTLSizeMake((N + 15) / 16 * 16, (M + 15) / 16 * 16, 1);
-        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        if (use_simd) {
+            MTLSize tg = MTLSizeMake(32, 1, 1);
+            MTLSize ntg = MTLSizeMake((N + 7) / 8, (M + 7) / 8, 1);
+            [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+        } else {
+            MTLSize tg = MTLSizeMake(16, 16, 1);
+            MTLSize grid = MTLSizeMake((N + 15) / 16 * 16, (M + 15) / 16 * 16, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        }
     }
 
     return is_1d ? output.squeeze(0) : output;
@@ -1167,7 +1554,11 @@ at::Tensor matmul_fp8_e4m3_mps(const at::Tensor& input, const at::Tensor& weight
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         auto encoder = stream->commandEncoder();
-        auto pipeline = get_pipeline("fp8_e4m3_linear");
+
+        // Use SIMD kernel for small batches (M <= 128), fallback to simple for larger
+        bool use_simd = (M <= 128 && N >= 8 && K >= 8);
+        const char* kernel_name = use_simd ? "fp8_matmul_simd" : "fp8_e4m3_linear";
+        auto pipeline = get_pipeline(kernel_name);
 
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(input_c) offset:0 atIndex:0];
@@ -1179,9 +1570,15 @@ at::Tensor matmul_fp8_e4m3_mps(const at::Tensor& input, const at::Tensor& weight
         uint32_t params[4] = {(uint32_t)M, (uint32_t)N, (uint32_t)K, has_bias ? 1u : 0u};
         for (int i = 0; i < 4; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
 
-        MTLSize tg = MTLSizeMake(16, 16, 1);
-        MTLSize grid = MTLSizeMake((N + 15) / 16 * 16, (M + 15) / 16 * 16, 1);
-        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        if (use_simd) {
+            MTLSize tg = MTLSizeMake(32, 1, 1);
+            MTLSize ntg = MTLSizeMake((N + 7) / 8, (M + 7) / 8, 1);
+            [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+        } else {
+            MTLSize tg = MTLSizeMake(16, 16, 1);
+            MTLSize grid = MTLSizeMake((N + 15) / 16 * 16, (M + 15) / 16 * 16, 1);
+            [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        }
     }
 
     return is_1d ? output.squeeze(0) : output;
@@ -1236,6 +1633,9 @@ PYBIND11_MODULE(_C, m) {
     m.def("matmul_int8", &matmul_int8_mps, "INT8 matmul",
           py::arg("A"), py::arg("B"), py::arg("A_scales"), py::arg("B_scales"),
           py::arg("out_dtype") = at::kHalf);
+    m.def("linear_int8", &linear_int8_mps, "INT8 linear layer (half input, int8 weight)",
+          py::arg("input"), py::arg("weight"), py::arg("weight_scales"),
+          py::arg("bias") = py::none(), py::arg("out_dtype") = at::kHalf);
 
     // NF4
     m.def("quantize_nf4", &quantize_nf4_mps, py::arg("input"), py::arg("block_size") = 64);
