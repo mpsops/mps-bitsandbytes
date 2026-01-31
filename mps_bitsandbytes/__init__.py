@@ -45,7 +45,7 @@ HuggingFace Integration:
 
 import torch as _torch
 
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 
 # Core functional API (bitsandbytes-compatible)
 from .functional import (

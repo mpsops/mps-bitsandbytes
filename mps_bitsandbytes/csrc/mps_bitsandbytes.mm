@@ -65,6 +65,9 @@ constant float FP4_CODEBOOK[16] = {
     -0.0f, -0.0625f, -0.125f, -0.25f, -0.375f, -0.5f, -0.75f, -1.0f
 };
 
+// Half (fp16) max representable value - values beyond this become Inf
+constant float FP16_MAX_VAL = 65504.0f;
+
 // =============================================================================
 // FP8 Conversion Functions
 // =============================================================================
@@ -166,7 +169,10 @@ kernel void int8_matmul_dequant(
 
     if (row < M && col < N) {
         float scale = (A_scales[row] * B_scales[col]) / (127.0f * 127.0f);
-        C[row * N + col] = half(float(acc) * scale);
+        float result = float(acc) * scale;
+        // Clamp to half range to prevent Inf
+        result = clamp(result, -FP16_MAX_VAL, FP16_MAX_VAL);
+        C[row * N + col] = half(result);
     }
 }
 
@@ -265,11 +271,15 @@ kernel void int8_matmul_simd(
         if (gr0 < M && gc0 < N) {
             float v = C_tile[r0][c0];
             if (has_bias) v += float(bias[gc0]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr0 * N + gc0] = half(v);
         }
         if (gr1 < M && gc1 < N) {
             float v = C_tile[r1][c1];
             if (has_bias) v += float(bias[gc1]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr1 * N + gc1] = half(v);
         }
     }
@@ -389,6 +399,8 @@ kernel void nf4_linear_simple(
     }
 
     if (has_bias) acc += float(bias[n]);
+    // Clamp to half range to prevent Inf
+    acc = clamp(acc, -FP16_MAX_VAL, FP16_MAX_VAL);
     output[m * N + n] = half(acc);
 }
 
@@ -514,11 +526,15 @@ kernel void nf4_matmul_simd(
         if (gr0 < M && gc0 < N) {
             float v = C_tile[r0][c0];
             if (has_bias) v += float(bias[gc0]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr0 * N + gc0] = half(v);
         }
         if (gr1 < M && gc1 < N) {
             float v = C_tile[r1][c1];
             if (has_bias) v += float(bias[gc1]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr1 * N + gc1] = half(v);
         }
     }
@@ -592,6 +608,8 @@ kernel void nf4_matmul_fused(
             if (oc >= N) continue;
             float r = acc[m][n];
             if (has_bias) r += float(bias[oc]);
+            // Clamp to half range to prevent Inf
+            r = clamp(r, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[or_ * N + oc] = half(r);
         }
     }
@@ -711,6 +729,8 @@ kernel void fp4_linear_simple(
     }
 
     if (has_bias) acc += float(bias[n]);
+    // Clamp to half range to prevent Inf
+    acc = clamp(acc, -FP16_MAX_VAL, FP16_MAX_VAL);
     output[m * N + n] = half(acc);
 }
 
@@ -814,11 +834,15 @@ kernel void fp4_matmul_simd(
         if (gr0 < M && gc0 < N) {
             float v = C_tile[r0][c0];
             if (has_bias) v += float(bias[gc0]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr0 * N + gc0] = half(v);
         }
         if (gr1 < M && gc1 < N) {
             float v = C_tile[r1][c1];
             if (has_bias) v += float(bias[gc1]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr1 * N + gc1] = half(v);
         }
     }
@@ -910,6 +934,8 @@ kernel void fp8_e4m3_linear(
     }
 
     if (has_bias) acc += float(bias[n]);
+    // Clamp to half range to prevent Inf
+    acc = clamp(acc, -FP16_MAX_VAL, FP16_MAX_VAL);
     output[m * N + n] = half(acc);
 }
 
@@ -1007,11 +1033,15 @@ kernel void fp8_matmul_simd(
         if (gr0 < M && gc0 < N) {
             float v = C_tile[r0][c0];
             if (has_bias) v += float(bias[gc0]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr0 * N + gc0] = half(v);
         }
         if (gr1 < M && gc1 < N) {
             float v = C_tile[r1][c1];
             if (has_bias) v += float(bias[gc1]);
+            // Clamp to half range to prevent Inf
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
             output[gr1 * N + gc1] = half(v);
         }
     }
