@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-bitsandbytes"
-version = "0.4.1"
+version = "0.4.2"
 description = "NF4/FP4/FP8/INT8 quantization for PyTorch on Apple Silicon with Metal GPU acceleration"
 readme = "README.md"
 license = "MIT"

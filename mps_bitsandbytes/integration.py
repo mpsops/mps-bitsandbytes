@@ -238,14 +238,15 @@ def quantize_model(
             bnb_4bit_compute_dtype=compute_dtype,
         )
 
-    # Move model to device first
-    model = model.to(device)
-
-    # Apply quantization
+    # Quantize on current device first (avoids loading full fp16 to GPU)
+    # Then move to target device
     if quantization_config.load_in_4bit:
         model = replace_linear_with_4bit(model, quantization_config, modules_to_not_convert)
     elif quantization_config.load_in_8bit:
         model = replace_linear_with_8bit(model, quantization_config, modules_to_not_convert)
+
+    # Move quantized model to target device
+    model = model.to(device)
 
     return model
 
