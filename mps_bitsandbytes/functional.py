@@ -643,17 +643,14 @@ def matmul_4bit(
         # Reshape input for matmul if needed
         orig_shape = A.shape
         if A.dim() > 2:
-            A_2d = A.view(-1, A.shape[-1])
+            A_2d = A.reshape(-1, A.shape[-1])
         else:
             A_2d = A
 
-        # For large batch sizes (M > 256), the tiled kernel is slower than
-        # dequantize+matmul due to per-element dequantization overhead.
-        # Fall back to unfused path in this case.
+        # For M > 512, dequant+matmul is faster (PyTorch's GEMM wins)
         M = A_2d.shape[0]
-        if M > 256:
-            # Use unfused path below
-            pass
+        if M > 512:
+            pass  # Fall through to unfused path
         else:
             # Handle double quantization - dequantize absmax first
             absmax = quant_state.absmax
@@ -671,11 +668,11 @@ def matmul_4bit(
 
             # Reshape weight from flat to [N, K_padded/2]
             packed_K = K_padded // 2
-            weight_2d = B.view(out_features, packed_K)
+            weight_2d = B.reshape(out_features, packed_K)
 
             # Reshape absmax to [N, num_blocks_per_row]
             num_blocks_per_row = K_padded // blocksize
-            absmax_2d = absmax.view(out_features, num_blocks_per_row)
+            absmax_2d = absmax.reshape(out_features, num_blocks_per_row)
 
             # Call native fused kernel (NF4 or FP4)
             if quant_state.quant_type == "nf4":
@@ -684,7 +681,7 @@ def matmul_4bit(
                 output = _C.matmul_fp4(A_2d, weight_2d, absmax_2d, bias, blocksize, A_2d.dtype)
 
             if len(orig_shape) > 2:
-                output = output.view(*orig_shape[:-1], -1)
+                output = output.reshape(*orig_shape[:-1], -1)
 
             return output
 
@@ -694,12 +691,12 @@ def matmul_4bit(
     # Reshape for matmul if needed
     orig_shape = A.shape
     if A.dim() > 2:
-        A = A.view(-1, A.shape[-1])
+        A = A.reshape(-1, A.shape[-1])
 
     output = torch.nn.functional.linear(A.to(weight.dtype), weight, bias)
 
     if len(orig_shape) > 2:
-        output = output.view(*orig_shape[:-1], -1)
+        output = output.reshape(*orig_shape[:-1], -1)
 
     return output
 

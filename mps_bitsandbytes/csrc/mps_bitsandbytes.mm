@@ -540,6 +540,142 @@ kernel void nf4_matmul_simd(
     }
 }
 
+// =============================================================================
+// NF4 MatMul Large Tile - 64x64 output with 8 simdgroups using simdgroup_matrix
+// Best for large M (>128) - reduces dispatch overhead, maximizes ALU utilization
+// =============================================================================
+
+kernel void nf4_matmul_large(
+    device const half* input [[buffer(0)]],       // [M, K]
+    device const uchar* weight [[buffer(1)]],     // [N, K_weight/2] packed
+    device const float* absmax [[buffer(2)]],     // [N, num_blocks]
+    device const half* bias [[buffer(3)]],        // [N]
+    device half* output [[buffer(4)]],            // [M, N]
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    constant uint& K_weight [[buffer(8)]],
+    constant uint& block_size [[buffer(9)]],
+    constant uint& has_bias [[buffer(10)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    // 256 threads = 8 simdgroups
+    // Each threadgroup handles 64x64 output
+    // Each simdgroup handles 8x64 output (8 rows, 64 cols = 8 x 8x8 matrices)
+    // simd_group_id: 0-7 = rows 0-7, 8-15, ..., 56-63
+
+    const uint TILE_OUT = 64;
+    const uint TILE_K = 32;  // K tile size
+
+    uint out_row_base = tgid.y * TILE_OUT + simd_group_id * 8;
+    uint out_col_base = tgid.x * TILE_OUT;
+
+    // Each simdgroup accumulates 8x64 = 1x8 grid of 8x8 simdgroup_matrices
+    simdgroup_matrix<float, 8, 8> C[8];
+    for (int j = 0; j < 8; j++)
+        C[j] = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // Shared memory for tiles
+    threadgroup half A_shared[64][TILE_K + 1];  // [64 rows, 32 K]
+    threadgroup half B_shared[TILE_K][64 + 1];  // [32 K, 64 N]
+
+    uint num_blocks = K_weight / block_size;
+
+    // Loop over K dimension in chunks of TILE_K
+    for (uint k_base = 0; k_base < K; k_base += TILE_K) {
+        // === Cooperative load of A tile [64 x 32] ===
+        // 256 threads, 2048 elements = 8 per thread
+        {
+            uint thread_id = simd_group_id * 32 + simd_lane_id;
+            for (uint i = 0; i < 8; i++) {
+                uint flat_idx = thread_id + i * 256;
+                uint local_row = flat_idx / TILE_K;
+                uint local_col = flat_idx % TILE_K;
+                uint global_row = tgid.y * TILE_OUT + local_row;
+                uint global_col = k_base + local_col;
+
+                half val = half(0);
+                if (global_row < M && global_col < K) {
+                    val = input[global_row * K + global_col];
+                }
+                A_shared[local_row][local_col] = val;
+            }
+        }
+
+        // === Cooperative load + dequantize B tile [32 x 64] ===
+        // B[k,n] = dequant(weight[n,k])
+        {
+            uint thread_id = simd_group_id * 32 + simd_lane_id;
+            for (uint i = 0; i < 8; i++) {
+                uint flat_idx = thread_id + i * 256;
+                uint local_k = flat_idx / 64;
+                uint local_n = flat_idx % 64;
+                uint global_k = k_base + local_k;
+                uint global_n = tgid.x * TILE_OUT + local_n;
+
+                half val = half(0);
+                if (global_k < K && global_n < N) {
+                    float scale = absmax[global_n * num_blocks + global_k / block_size];
+                    uchar packed = weight[global_n * (K_weight/2) + global_k/2];
+                    val = half(dequant_nf4(packed, global_k % 2, scale));
+                }
+                B_shared[local_k][local_n] = val;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // === Each simdgroup computes its 8x64 output ===
+        // Loop over K in chunks of 8 for simdgroup_matrix
+        for (uint k_inner = 0; k_inner < TILE_K; k_inner += 8) {
+            // Load A matrix for this simdgroup's rows [8x8]
+            simdgroup_matrix<half, 8, 8> A_mat;
+            simdgroup_load(A_mat, &A_shared[simd_group_id * 8][k_inner], TILE_K + 1);
+
+            // Load B matrices for all 8 columns [8x8 each]
+            simdgroup_matrix<half, 8, 8> B_mat[8];
+            for (int ni = 0; ni < 8; ni++) {
+                simdgroup_load(B_mat[ni], &B_shared[k_inner][ni * 8], 65);
+            }
+
+            // Multiply-accumulate: C[ni] += A_mat * B_mat[ni]
+            for (int ni = 0; ni < 8; ni++) {
+                simdgroup_multiply_accumulate(C[ni], A_mat, B_mat[ni], C[ni]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // === Store results directly to global memory ===
+    // Each simdgroup stores its 8x64 (8 x 8x8 matrices)
+    // Use separate shared memory per simdgroup to avoid conflicts
+    threadgroup float C_all[8][8][65];  // [simdgroup][row][col]
+
+    for (int ni = 0; ni < 8; ni++) {
+        simdgroup_store(C[ni], &C_all[simd_group_id][0][ni * 8], 65);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each lane writes 16 elements (512 / 32 = 16)
+    for (uint i = 0; i < 16; i++) {
+        uint flat_idx = simd_lane_id + i * 32;
+        uint local_row = flat_idx / 64;
+        uint local_col = flat_idx % 64;
+        uint global_row = out_row_base + local_row;
+        uint global_col = out_col_base + local_col;
+
+        if (global_row < M && global_col < N) {
+            float v = C_all[simd_group_id][local_row][local_col];
+            if (has_bias) v += float(bias[global_col]);
+            v = clamp(v, -FP16_MAX_VAL, FP16_MAX_VAL);
+            output[global_row * N + global_col] = half(v);
+        }
+    }
+}
+
 kernel void nf4_matmul_fused(
     device const half* input [[buffer(0)]],
     device const uchar* weight [[buffer(1)]],
@@ -1353,13 +1489,17 @@ at::Tensor matmul_nf4_mps(const at::Tensor& input, const at::Tensor& weight_pack
         auto encoder = stream->commandEncoder();
 
         // Choose kernel based on matrix size:
-        // - simd: M <= 128 (best for small batches, up to 18x faster for M=8)
-        // - tiled: M > 128 with N >= 32, K >= 64 (better for large batches)
+        // - simd: M <= 128, N >= 8, K >= 8 (8x8 tiles, 1 simdgroup - up to 15x faster)
+        // - large: 128 < M <= 512, N >= 64, K >= 32 (64x64 tiles, 8 simdgroups - 1.1-1.9x faster)
+        // - For M > 512: fall back to dequant+matmul (PyTorch's GEMM is faster)
+        // - tiled: fallback for edge cases
         // - simple: fallback for very small matrices
         bool use_simd = (M <= 128 && N >= 8 && K >= 8);
-        bool use_tiled = !use_simd && (M >= 32 && N >= 32 && K >= 64);
+        bool use_large = (M > 128 && M <= 512 && N >= 64 && K >= 32);
+        bool use_tiled = !use_simd && !use_large && (M >= 32 && N >= 32 && K >= 64);
 
         const char* kernel_name = use_simd ? "nf4_matmul_simd" :
+                                  use_large ? "nf4_matmul_large" :
                                   use_tiled ? "nf4_matmul_fused" : "nf4_linear_simple";
         auto pipeline = get_pipeline(kernel_name);
 
@@ -1378,6 +1518,12 @@ at::Tensor matmul_nf4_mps(const at::Tensor& input, const at::Tensor& weight_pack
             // Each threadgroup handles 8x8 output
             MTLSize tg = MTLSizeMake(32, 1, 1);
             MTLSize ntg = MTLSizeMake((N + 7) / 8, (M + 7) / 8, 1);
+            [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+        } else if (use_large) {
+            // Large kernel: 256 threads (8 simdgroups) per threadgroup
+            // Each threadgroup handles 64x64 output
+            MTLSize tg = MTLSizeMake(256, 1, 1);
+            MTLSize ntg = MTLSizeMake((N + 63) / 64, (M + 63) / 64, 1);
             [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
         } else if (use_tiled) {
             MTLSize tg = MTLSizeMake(8, 8, 1);
