@@ -106,14 +106,14 @@ class Linear4bit(nn.Module):
         # Handle batched input
         orig_shape = x.shape
         if x.dim() > 2:
-            x = x.view(-1, self.in_features)
+            x = x.reshape(-1, self.in_features)
 
         # Fused 4-bit matmul (dequantize + matmul)
         output = matmul_4bit(x, self.weight, self.weight_quant_state, self.bias)
 
         # Restore batch dimensions
         if len(orig_shape) > 2:
-            output = output.view(*orig_shape[:-1], self.out_features)
+            output = output.reshape(*orig_shape[:-1], self.out_features)
 
         return output
 
