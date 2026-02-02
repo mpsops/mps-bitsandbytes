@@ -8,6 +8,8 @@ Uses dynamic quantization with blockwise scaling for accuracy.
 import torch
 from torch.optim import Optimizer
 from typing import Tuple, Optional, Callable
+import threading
+import warnings
 
 
 def quantize_state(state: torch.Tensor, block_size: int = 256) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -53,15 +55,34 @@ def dequantize_state(state_int8: torch.Tensor, absmax: torch.Tensor,
     return state_dequant.flatten()[:numel].view(orig_shape).to(dtype)
 
 
-def quantize_state_unsigned(state: torch.Tensor, block_size: int = 256) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_state_unsigned(state: torch.Tensor, block_size: int = 256,
+                            warn_on_negative: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize non-negative state (like exp_avg_sq) to uint8 with dynamic exponent.
 
     Uses log-linear quantization to preserve small values that matter for Adam's
     denominator. Stores (max_val, min_nonzero) per block to reconstruct values.
+
+    Args:
+        state: Input tensor (expected to be non-negative)
+        block_size: Quantization block size
+        warn_on_negative: If True, warn when negative values are clamped
     """
     orig_shape = state.shape
-    state_flat = state.flatten().float().clamp(min=0)
+    state_flat = state.flatten().float()
+
+    # Check for negative values and warn if requested
+    if warn_on_negative:
+        neg_count = (state_flat < 0).sum().item()
+        if neg_count > 0:
+            warnings.warn(
+                f"quantize_state_unsigned: {neg_count} negative values clamped to 0. "
+                f"This may indicate an issue with the optimizer state.",
+                UserWarning,
+                stacklevel=2
+            )
+
+    state_flat = state_flat.clamp(min=0)
 
     # Pad to block_size multiple
     numel = state_flat.numel()
@@ -142,6 +163,7 @@ class Adam8bit(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0,
         block_size: int = 256,
+        max_grad_norm: Optional[float] = None,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -153,10 +175,13 @@ class Adam8bit(Optimizer):
             raise ValueError(f"Invalid beta2: {betas[1]}")
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if max_grad_norm is not None and max_grad_norm <= 0.0:
+            raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
 
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-                       block_size=block_size)
+                       block_size=block_size, max_grad_norm=max_grad_norm)
         super().__init__(params, defaults)
+        self._state_init_lock = threading.Lock()
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
@@ -168,6 +193,13 @@ class Adam8bit(Optimizer):
 
         for group in self.param_groups:
             beta1, beta2 = group['betas']
+            max_grad_norm = group.get('max_grad_norm')
+
+            # Optional gradient clipping
+            if max_grad_norm is not None:
+                params_with_grad = [p for p in group['params'] if p.grad is not None]
+                if params_with_grad:
+                    torch.nn.utils.clip_grad_norm_(params_with_grad, max_grad_norm)
             block_size = group['block_size']
 
             for p in group['params']:
@@ -180,18 +212,21 @@ class Adam8bit(Optimizer):
 
                 state = self.state[p]
 
-                # State initialization
+                # State initialization (thread-safe)
                 if len(state) == 0:
-                    state['step'] = 0
-                    # Initialize in 8-bit (exp_avg uses signed, exp_avg_sq uses unsigned)
-                    state['exp_avg_int8'], state['exp_avg_absmax'] = quantize_state(
-                        torch.zeros_like(p, memory_format=torch.preserve_format),
-                        block_size
-                    )
-                    state['exp_avg_sq_uint8'], state['exp_avg_sq_max'] = quantize_state_unsigned(
-                        torch.zeros_like(p, memory_format=torch.preserve_format),
-                        block_size
-                    )
+                    with self._state_init_lock:
+                        # Double-check after acquiring lock
+                        if len(state) == 0:
+                            state['step'] = 0
+                            # Initialize in 8-bit (exp_avg uses signed, exp_avg_sq uses unsigned)
+                            state['exp_avg_int8'], state['exp_avg_absmax'] = quantize_state(
+                                torch.zeros_like(p, memory_format=torch.preserve_format),
+                                block_size
+                            )
+                            state['exp_avg_sq_uint8'], state['exp_avg_sq_max'] = quantize_state_unsigned(
+                                torch.zeros_like(p, memory_format=torch.preserve_format),
+                                block_size
+                            )
 
                 state['step'] += 1
 
@@ -256,6 +291,7 @@ class AdamW8bit(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
         block_size: int = 256,
+        max_grad_norm: Optional[float] = None,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -267,10 +303,13 @@ class AdamW8bit(Optimizer):
             raise ValueError(f"Invalid beta2: {betas[1]}")
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if max_grad_norm is not None and max_grad_norm <= 0.0:
+            raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
 
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-                       block_size=block_size)
+                       block_size=block_size, max_grad_norm=max_grad_norm)
         super().__init__(params, defaults)
+        self._state_init_lock = threading.Lock()
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
@@ -283,6 +322,13 @@ class AdamW8bit(Optimizer):
         for group in self.param_groups:
             beta1, beta2 = group['betas']
             block_size = group['block_size']
+            max_grad_norm = group.get('max_grad_norm')
+
+            # Optional gradient clipping
+            if max_grad_norm is not None:
+                params_with_grad = [p for p in group['params'] if p.grad is not None]
+                if params_with_grad:
+                    torch.nn.utils.clip_grad_norm_(params_with_grad, max_grad_norm)
 
             for p in group['params']:
                 if p.grad is None:
@@ -294,17 +340,20 @@ class AdamW8bit(Optimizer):
 
                 state = self.state[p]
 
-                # State initialization
+                # State initialization (thread-safe)
                 if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg_int8'], state['exp_avg_absmax'] = quantize_state(
-                        torch.zeros_like(p, memory_format=torch.preserve_format),
-                        block_size
-                    )
-                    state['exp_avg_sq_uint8'], state['exp_avg_sq_max'] = quantize_state_unsigned(
-                        torch.zeros_like(p, memory_format=torch.preserve_format),
-                        block_size
-                    )
+                    with self._state_init_lock:
+                        # Double-check after acquiring lock
+                        if len(state) == 0:
+                            state['step'] = 0
+                            state['exp_avg_int8'], state['exp_avg_absmax'] = quantize_state(
+                                torch.zeros_like(p, memory_format=torch.preserve_format),
+                                block_size
+                            )
+                            state['exp_avg_sq_uint8'], state['exp_avg_sq_max'] = quantize_state_unsigned(
+                                torch.zeros_like(p, memory_format=torch.preserve_format),
+                                block_size
+                            )
 
                 state['step'] += 1
 

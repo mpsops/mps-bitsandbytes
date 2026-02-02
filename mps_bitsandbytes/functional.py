@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 from typing import Tuple, Optional
 from dataclasses import dataclass
+import warnings
 
 # =============================================================================
 # Codebooks
@@ -41,6 +42,11 @@ def create_fp4_map(signed=True):
     return FP4_CODEBOOK.clone()
 
 
+# Track fallback occurrences for debugging
+_native_fallback_count = 0
+_native_fallback_warned = False
+
+
 def _try_load_native():
     """Try to load native C++ extension."""
     try:
@@ -48,6 +54,33 @@ def _try_load_native():
         return _C
     except ImportError:
         return None
+
+
+def _warn_native_fallback(operation: str):
+    """Warn user when falling back to Python implementation."""
+    global _native_fallback_count, _native_fallback_warned
+    _native_fallback_count += 1
+
+    # Only warn once per session to avoid spam
+    if not _native_fallback_warned:
+        warnings.warn(
+            f"mps-bitsandbytes: Native kernel unavailable for {operation}, "
+            f"using Python fallback (10-100x slower). "
+            f"Build the C++ extension with: pip install -e . --no-build-isolation",
+            UserWarning,
+            stacklevel=3
+        )
+        _native_fallback_warned = True
+
+
+def _check_device(tensor: Tensor, operation: str = "operation"):
+    """Check if tensor is on a supported device (MPS or CPU)."""
+    device_type = tensor.device.type
+    if device_type not in ('mps', 'cpu'):
+        raise ValueError(
+            f"mps-bitsandbytes {operation} requires tensor on 'mps' or 'cpu' device, "
+            f"got '{device_type}'. Move tensor with .to('mps') or .to('cpu')"
+        )
 
 
 # =============================================================================
@@ -157,6 +190,22 @@ def quantize_4bit(
     """
     if quant_type not in ("nf4", "fp4"):
         raise ValueError(f"quant_type must be 'nf4' or 'fp4', got {quant_type}")
+
+    # Validate device
+    _check_device(A, "quantize_4bit")
+
+    # Validate blocksize to prevent overflow and ensure reasonable values
+    if blocksize <= 0:
+        raise ValueError(f"blocksize must be positive, got {blocksize}")
+    if blocksize > 65536:
+        raise ValueError(f"blocksize too large ({blocksize}), max is 65536")
+    if (blocksize & (blocksize - 1)) != 0:
+        raise ValueError(f"blocksize must be a power of 2, got {blocksize}")
+
+    # Check tensor size to prevent overflow in padding calculation
+    max_safe_numel = 2**31 - 1  # Max int32 to avoid overflow
+    if A.numel() > max_safe_numel:
+        raise ValueError(f"Tensor too large ({A.numel()} elements), max is {max_safe_numel}")
 
     orig_shape = A.shape
     orig_dtype = A.dtype
@@ -439,6 +488,15 @@ def quantize_blockwise(
     Returns:
         Tuple of (quantized tensor, QuantState)
     """
+    # Validate device
+    _check_device(A, "quantize_blockwise")
+
+    # Validate blocksize
+    if blocksize <= 0:
+        raise ValueError(f"blocksize must be positive, got {blocksize}")
+    if blocksize > 65536:
+        raise ValueError(f"blocksize too large ({blocksize}), max is 65536")
+
     orig_shape = A.shape
     orig_dtype = A.dtype
     A = A.contiguous().flatten()
@@ -601,6 +659,7 @@ def quantize_fp8_e4m3(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     _C = _try_load_native()
     if _C is not None and tensor.device.type == 'mps':
         return _C.quantize_fp8_e4m3(tensor)
+    _warn_native_fallback("quantize_fp8_e4m3")
     return _quantize_fp8_e4m3_python(tensor)
 
 
@@ -610,6 +669,7 @@ def dequantize_fp8_e4m3(quantized: Tensor, scales: Tensor,
     _C = _try_load_native()
     if _C is not None and quantized.device.type == 'mps':
         return _C.dequantize_fp8_e4m3(quantized, scales, dtype)
+    _warn_native_fallback("dequantize_fp8_e4m3")
     return _dequantize_fp8_e4m3_python(quantized, scales, dtype)
 
 
@@ -690,6 +750,7 @@ def matmul_4bit(
             return output
 
     # Python fallback: Dequantize weights then matmul
+    _warn_native_fallback("matmul_4bit")
     weight = dequantize_4bit(B, quant_state)
 
     # Reshape for matmul if needed
@@ -875,6 +936,9 @@ def matmul_colrow(input: Tensor, weight_int8: Tensor,
                   dtype: torch.dtype = torch.float16) -> Tensor:
     """Matrix multiplication with column+row quantized weights."""
     weight_dequant = dequantize_colrow(weight_int8, weight_row_scales, weight_col_scales, dtype)
+    # Ensure bias is cast to the same dtype to avoid type mismatch errors on MPS
+    if bias is not None:
+        bias = bias.to(dtype)
     output = torch.nn.functional.linear(input.to(dtype), weight_dequant, bias)
     return output
 
@@ -1004,32 +1068,133 @@ def _float_to_fp8_e4m3(val: float) -> int:
 
 
 def _quantize_fp8_e4m3_python(tensor: Tensor) -> Tuple[Tensor, Tensor]:
-    """Python FP8 E4M3 quantization."""
+    """Python FP8 E4M3 quantization - vectorized implementation."""
     rows, cols = tensor.shape
     tensor_f32 = tensor.float()
 
     absmax = tensor_f32.abs().max(dim=1).values
     scales = (absmax / 448.0).clamp(min=1e-12)
 
-    output = torch.zeros(rows, cols, dtype=torch.uint8, device=tensor.device)
-    for r in range(rows):
-        for c in range(cols):
-            val = tensor_f32[r, c].item() / scales[r].item()
-            output[r, c] = _float_to_fp8_e4m3(val)
+    # Normalize values by row scales
+    normalized = tensor_f32 / scales.unsqueeze(1)
+
+    # Clamp to FP8 E4M3 range [-448, 448]
+    normalized = normalized.clamp(-448.0, 448.0)
+
+    # Vectorized FP8 E4M3 encoding
+    output = _float_to_fp8_e4m3_vectorized(normalized)
 
     return output, scales
 
 
+def _float_to_fp8_e4m3_vectorized(values: Tensor) -> Tensor:
+    """
+    Vectorized conversion of float tensor to FP8 E4M3 format.
+
+    FP8 E4M3: 1 sign bit, 4 exponent bits, 3 mantissa bits
+    Range: +/- 448, special values: NaN = 0x7F
+    """
+    # Handle NaN
+    nan_mask = torch.isnan(values)
+
+    # Extract sign and work with absolute values
+    sign = (values < 0).to(torch.uint8) << 7
+    abs_val = values.abs()
+
+    # Clamp to max representable value
+    abs_val = abs_val.clamp(max=448.0)
+
+    # Zero handling
+    zero_mask = abs_val == 0
+
+    # Compute exponent: floor(log2(x)) for x > 0
+    # Use log2 and floor, handling zero specially
+    log2_val = torch.where(abs_val > 0, torch.log2(abs_val), torch.zeros_like(abs_val))
+    exp = torch.floor(log2_val).to(torch.int32)
+
+    # Compute biased exponent (bias = 7)
+    biased_exp = exp + 7
+
+    # Compute mantissa: (x / 2^exp) - 1, scaled to 3 bits
+    # mantissa_float = (abs_val / 2^exp) - 1
+    pow2_exp = torch.pow(2.0, exp.float())
+    pow2_exp = torch.where(abs_val > 0, pow2_exp, torch.ones_like(pow2_exp))
+    mantissa_float = (abs_val / pow2_exp) - 1.0
+    mantissa_bits = (mantissa_float * 8.0 + 0.5).clamp(0, 7).to(torch.uint8)
+
+    # Handle subnormals (biased_exp <= 0)
+    subnormal_mask = biased_exp <= 0
+
+    # Handle overflow (biased_exp >= 15) - clamp to max
+    overflow_mask = biased_exp >= 15
+
+    # Build FP8 value for normal case
+    biased_exp_clamped = biased_exp.clamp(0, 15).to(torch.uint8)
+    fp8_normal = sign | (biased_exp_clamped << 3) | mantissa_bits
+
+    # Subnormal: just sign bit (simplified - full subnormal support would need more work)
+    fp8_subnormal = sign
+
+    # Overflow: max value = sign | (14 << 3) | 7
+    fp8_overflow = sign | ((14 << 3) | 7)
+
+    # Combine cases
+    result = torch.where(zero_mask, sign, fp8_normal)
+    result = torch.where(subnormal_mask & ~zero_mask, fp8_subnormal, result)
+    result = torch.where(overflow_mask, fp8_overflow, result)
+    result = torch.where(nan_mask, torch.full_like(result, 0x7F), result)
+
+    return result
+
+
 def _dequantize_fp8_e4m3_python(quantized: Tensor, scales: Tensor,
                                  dtype: torch.dtype) -> Tensor:
-    """Python FP8 E4M3 dequantization."""
-    rows, cols = quantized.shape
-    output = torch.zeros(rows, cols, dtype=dtype, device=quantized.device)
+    """Python FP8 E4M3 dequantization - vectorized implementation."""
+    # Vectorized FP8 to float conversion
+    float_values = _fp8_e4m3_to_float_vectorized(quantized)
 
-    for r in range(rows):
-        scale = scales[r].item()
-        for c in range(cols):
-            fp8_val = quantized[r, c].item()
-            output[r, c] = _fp8_e4m3_to_float(fp8_val) * scale
+    # Apply row-wise scales
+    output = float_values * scales.unsqueeze(1)
 
-    return output
+    return output.to(dtype)
+
+
+def _fp8_e4m3_to_float_vectorized(fp8: Tensor) -> Tensor:
+    """
+    Vectorized conversion of FP8 E4M3 tensor to float.
+
+    FP8 E4M3: 1 sign bit, 4 exponent bits, 3 mantissa bits
+    """
+    fp8_int = fp8.to(torch.int32)
+
+    # Extract components
+    sign = (fp8_int >> 7) & 0x1
+    exp = (fp8_int >> 3) & 0xF
+    mant = fp8_int & 0x7
+
+    # Normal case: (1 + mant/8) * 2^(exp-7)
+    # Compute 2^(exp-7) using ldexp equivalent
+    # ldexp(x, n) = x * 2^n
+    normal_result = (1.0 + mant.float() / 8.0) * torch.pow(2.0, (exp - 7).float())
+
+    # Subnormal case (exp == 0): (mant/8) * 2^(-6)
+    subnormal_result = (mant.float() / 8.0) * (2.0 ** -6)
+
+    # Zero case (exp == 0, mant == 0)
+    zero_mask = (exp == 0) & (mant == 0)
+
+    # NaN case (exp == 15, mant == 7)
+    nan_mask = (exp == 15) & (mant == 7)
+
+    # Subnormal mask (exp == 0, mant != 0)
+    subnormal_mask = (exp == 0) & (mant != 0)
+
+    # Combine cases
+    result = torch.where(exp == 0, subnormal_result, normal_result)
+    result = torch.where(zero_mask, torch.zeros_like(result), result)
+    result = torch.where(nan_mask, torch.full_like(result, float('nan')), result)
+
+    # Apply sign
+    result = torch.where(sign == 1, -result, result)
+
+    return result

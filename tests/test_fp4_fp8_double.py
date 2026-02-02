@@ -408,5 +408,150 @@ class TestImports:
         assert len(FP4_CODEBOOK) == 16
 
 
+class TestInputValidation:
+    """Tests for input validation and edge cases."""
+
+    def test_blocksize_validation_negative(self):
+        """Test that negative blocksize raises error."""
+        from mps_bitsandbytes import quantize_4bit
+
+        tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
+        with pytest.raises(ValueError, match="blocksize must be positive"):
+            quantize_4bit(tensor, blocksize=-1)
+
+    def test_blocksize_validation_zero(self):
+        """Test that zero blocksize raises error."""
+        from mps_bitsandbytes import quantize_4bit
+
+        tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
+        with pytest.raises(ValueError, match="blocksize must be positive"):
+            quantize_4bit(tensor, blocksize=0)
+
+    def test_blocksize_validation_too_large(self):
+        """Test that oversized blocksize raises error."""
+        from mps_bitsandbytes import quantize_4bit
+
+        tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
+        with pytest.raises(ValueError, match="blocksize too large"):
+            quantize_4bit(tensor, blocksize=100000)
+
+    def test_blocksize_validation_not_power_of_2(self):
+        """Test that non-power-of-2 blocksize raises error."""
+        from mps_bitsandbytes import quantize_4bit
+
+        tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
+        with pytest.raises(ValueError, match="power of 2"):
+            quantize_4bit(tensor, blocksize=63)
+
+    def test_blockwise_blocksize_validation(self):
+        """Test blocksize validation in quantize_blockwise."""
+        from mps_bitsandbytes import quantize_blockwise
+
+        tensor = torch.randn(1024, device='mps', dtype=torch.float16)
+        with pytest.raises(ValueError, match="blocksize must be positive"):
+            quantize_blockwise(tensor, blocksize=-1)
+
+    def test_quant_type_validation(self):
+        """Test that invalid quant_type raises error."""
+        from mps_bitsandbytes import quantize_4bit
+
+        tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
+        with pytest.raises(ValueError, match="quant_type must be"):
+            quantize_4bit(tensor, quant_type="invalid")
+
+
+class TestFP8Vectorized:
+    """Tests for vectorized FP8 implementation."""
+
+    def test_fp8_vectorized_basic(self):
+        """Test vectorized FP8 produces valid output."""
+        from mps_bitsandbytes import quantize_fp8_e4m3, dequantize_fp8_e4m3
+
+        tensor = torch.randn(64, 128, device='mps', dtype=torch.float16)
+        quantized, scales = quantize_fp8_e4m3(tensor)
+        reconstructed = dequantize_fp8_e4m3(quantized, scales)
+
+        assert quantized.shape == tensor.shape
+        assert not torch.isnan(reconstructed).any()
+
+    def test_fp8_vectorized_zeros(self):
+        """Test FP8 handles zeros correctly."""
+        from mps_bitsandbytes import quantize_fp8_e4m3, dequantize_fp8_e4m3
+
+        tensor = torch.zeros(16, 32, device='mps', dtype=torch.float16)
+        quantized, scales = quantize_fp8_e4m3(tensor)
+        reconstructed = dequantize_fp8_e4m3(quantized, scales)
+
+        assert torch.allclose(reconstructed, tensor, atol=1e-6)
+
+    def test_fp8_vectorized_large_values(self):
+        """Test FP8 handles large values (clamped to 448)."""
+        from mps_bitsandbytes import quantize_fp8_e4m3, dequantize_fp8_e4m3
+
+        # Values larger than 448 should be clamped
+        tensor = torch.full((8, 16), 1000.0, device='mps', dtype=torch.float16)
+        quantized, scales = quantize_fp8_e4m3(tensor)
+        reconstructed = dequantize_fp8_e4m3(quantized, scales)
+
+        # After normalization and reconstruction, values should be reasonable
+        assert not torch.isinf(reconstructed).any()
+        assert not torch.isnan(reconstructed).any()
+
+    def test_fp8_vectorized_accuracy(self):
+        """Test vectorized FP8 has good accuracy."""
+        from mps_bitsandbytes import quantize_fp8_e4m3, dequantize_fp8_e4m3
+
+        torch.manual_seed(42)
+        tensor = torch.randn(32, 64, device='mps', dtype=torch.float16)
+        quantized, scales = quantize_fp8_e4m3(tensor)
+        reconstructed = dequantize_fp8_e4m3(quantized, scales)
+
+        # FP8 should have high cosine similarity
+        cosine_sim = torch.nn.functional.cosine_similarity(
+            tensor.float().flatten().unsqueeze(0),
+            reconstructed.float().flatten().unsqueeze(0)
+        ).item()
+        assert cosine_sim > 0.95, f"FP8 vectorized cosine sim {cosine_sim} too low"
+
+
+class TestLinear4bitDeviceHandling:
+    """Tests for Linear4bit device handling."""
+
+    def test_load_state_dict_device_mismatch(self):
+        """Test loading state dict from different device."""
+        from mps_bitsandbytes import Linear4bit
+
+        # Create layer on MPS
+        linear = torch.nn.Linear(64, 32).half().to('mps')
+        l4 = Linear4bit.from_linear(linear)
+
+        # Save state dict
+        state_dict = l4.state_dict()
+
+        # Move tensors to CPU (simulating loading from CPU checkpoint)
+        # Handle both tensor and dict values (quant_state is a dict)
+        def move_to_cpu(v):
+            if isinstance(v, torch.Tensor):
+                return v.cpu()
+            elif isinstance(v, dict):
+                return {k2: move_to_cpu(v2) for k2, v2 in v.items()}
+            return v
+
+        cpu_state_dict = {k: move_to_cpu(v) for k, v in state_dict.items()}
+
+        # Create new layer on MPS and load CPU state dict
+        linear2 = torch.nn.Linear(64, 32).half().to('mps')
+        l4_new = Linear4bit.from_linear(linear2)
+        l4_new.load_state_dict(cpu_state_dict)
+
+        # Verify weights are on MPS
+        assert l4_new.weight.device.type == 'mps'
+
+        # Verify forward works
+        x = torch.randn(8, 64, device='mps', dtype=torch.float16)
+        output = l4_new(x)
+        assert output.device.type == 'mps'
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

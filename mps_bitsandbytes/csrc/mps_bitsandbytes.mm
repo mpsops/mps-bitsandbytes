@@ -19,22 +19,41 @@
 #include <fstream>
 #include <sstream>
 #include <dlfcn.h>
+#include <mutex>
+#include <atomic>
 
 // =============================================================================
-// Metal Device and Libraries
+// Metal Device and Libraries (Thread-Safe)
 // =============================================================================
 
 static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
 static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipelines;
 
+// Thread-safety primitives
+static std::mutex g_init_mutex;
+static std::atomic<bool> g_device_initialized{false};
+
 static void ensure_device() {
-    if (!g_device) {
-        g_device = MTLCreateSystemDefaultDevice();
-        if (!g_device) {
-            throw std::runtime_error("Failed to create Metal device");
-        }
+    // Fast path: already initialized
+    if (g_device_initialized.load(std::memory_order_acquire)) {
+        return;
     }
+
+    // Slow path: acquire lock and initialize
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Double-check after acquiring lock
+    if (g_device_initialized.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    g_device = MTLCreateSystemDefaultDevice();
+    if (!g_device) {
+        throw std::runtime_error("Failed to create Metal device");
+    }
+
+    g_device_initialized.store(true, std::memory_order_release);
 }
 
 // =============================================================================
@@ -1242,11 +1261,26 @@ kernel void double_quant_absmax(
 )";
 
 // =============================================================================
-// Initialize Metal Library
+// Initialize Metal Library (Thread-Safe)
 // =============================================================================
 
+static std::atomic<bool> g_library_initialized{false};
+static std::mutex g_library_mutex;
+static std::mutex g_pipeline_mutex;
+
 static void init_library() {
-    if (g_library) return;
+    // Fast path: already initialized
+    if (g_library_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Slow path: acquire lock and initialize
+    std::lock_guard<std::mutex> lock(g_library_mutex);
+
+    // Double-check after acquiring lock
+    if (g_library_initialized.load(std::memory_order_relaxed)) {
+        return;
+    }
 
     ensure_device();
 
@@ -1263,16 +1297,24 @@ static void init_library() {
                 std::string([[error localizedDescription] UTF8String]));
         }
     }
+
+    g_library_initialized.store(true, std::memory_order_release);
 }
 
 static id<MTLComputePipelineState> get_pipeline(const std::string& name) {
     init_library();
 
-    auto it = g_pipelines.find(name);
-    if (it != g_pipelines.end()) {
-        return it->second;
+    // Check cache with lock (pipelines map is not thread-safe)
+    {
+        std::lock_guard<std::mutex> lock(g_pipeline_mutex);
+        auto it = g_pipelines.find(name);
+        if (it != g_pipelines.end()) {
+            return it->second;
+        }
     }
 
+    // Create pipeline (can be done outside lock)
+    id<MTLComputePipelineState> pipeline = nil;
     @autoreleasepool {
         NSError* error = nil;
         id<MTLFunction> fn = [g_library newFunctionWithName:
@@ -1281,15 +1323,20 @@ static id<MTLComputePipelineState> get_pipeline(const std::string& name) {
             throw std::runtime_error("Function not found: " + name);
         }
 
-        id<MTLComputePipelineState> pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
+        pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!pipeline) {
             throw std::runtime_error("Failed to create pipeline: " + name);
         }
-
-        g_pipelines[name] = pipeline;
-        return pipeline;
     }
+
+    // Store in cache with lock
+    {
+        std::lock_guard<std::mutex> lock(g_pipeline_mutex);
+        // Another thread may have added it, but that's OK - overwrite is safe
+        g_pipelines[name] = pipeline;
+    }
+
+    return pipeline;
 }
 
 // =============================================================================

@@ -216,8 +216,16 @@ class Linear4bit(nn.Module):
         that needs to create tensors on the same device as this layer.
         Standard PyTorch uses weight.device, but since our weight is a
         buffer (not a parameter), next(module.parameters()) may fail.
+
+        Returns device from weight buffer, or bias parameter if weight
+        is not yet initialized.
         """
-        return self.weight.device
+        if self.weight is not None and self.weight.numel() > 0:
+            return self.weight.device
+        if self.bias is not None:
+            return self.bias.device
+        # Fallback to CPU if nothing is initialized
+        return torch.device('cpu')
 
     def _apply(self, fn):
         """Override _apply to also move quant_state when .to() is called."""
@@ -242,18 +250,48 @@ class Linear4bit(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         """Handle loading from state dict, including conversion from FP16/FP32."""
+        import warnings
+        target_device = self.weight.device
+
         # Check for quant_state
         quant_state_key = prefix + 'weight_quant_state'
         if quant_state_key in state_dict:
+            loaded_state = state_dict.pop(quant_state_key)
+
+            # Validate blocksize matches
+            loaded_blocksize = loaded_state.get('blocksize', 64)
+            if loaded_blocksize != self.blocksize:
+                warnings.warn(
+                    f"Linear4bit blocksize mismatch: layer has blocksize={self.blocksize}, "
+                    f"checkpoint has blocksize={loaded_blocksize}. Using checkpoint blocksize.",
+                    UserWarning
+                )
+                self.blocksize = loaded_blocksize
+
+            # Validate quant_type matches
+            loaded_quant_type = loaded_state.get('quant_type', 'nf4')
+            if loaded_quant_type != self.quant_type:
+                warnings.warn(
+                    f"Linear4bit quant_type mismatch: layer has quant_type='{self.quant_type}', "
+                    f"checkpoint has quant_type='{loaded_quant_type}'. Using checkpoint quant_type.",
+                    UserWarning
+                )
+                self.quant_type = loaded_quant_type
+
             self.weight_quant_state = QuantState.from_dict(
-                state_dict.pop(quant_state_key),
-                device=self.weight.device
+                loaded_state,
+                device=target_device
             )
 
         # Check if we're loading from a non-quantized state dict
         weight_key = prefix + 'weight'
         if weight_key in state_dict:
             weight_data = state_dict[weight_key]
+
+            # Move weight to target device if needed
+            if weight_data.device != target_device:
+                weight_data = weight_data.to(target_device)
+
             # If it's a full-precision weight, quantize it
             if weight_data.dtype in (torch.float16, torch.float32, torch.bfloat16):
                 weight_packed, quant_state = quantize_4bit(
@@ -264,6 +302,9 @@ class Linear4bit(nn.Module):
                 )
                 state_dict[weight_key] = weight_packed
                 self.weight_quant_state = quant_state
+            else:
+                # Already quantized, just ensure it's on the right device
+                state_dict[weight_key] = weight_data
 
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
