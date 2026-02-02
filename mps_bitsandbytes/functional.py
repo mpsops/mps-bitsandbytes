@@ -622,6 +622,7 @@ def matmul_4bit(
     B: Tensor,
     quant_state: QuantState,
     bias: Optional[Tensor] = None,
+    compute_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """
     Matrix multiplication with 4-bit quantized weights.
@@ -633,10 +634,13 @@ def matmul_4bit(
         B: Quantized weight tensor (packed uint8)
         quant_state: QuantState from quantize_4bit
         bias: Optional bias tensor
+        compute_dtype: Output dtype (default: input dtype)
 
     Returns:
         Output tensor [..., out_features]
     """
+    if compute_dtype is None:
+        compute_dtype = A.dtype
     # Try native fused kernel
     _C = _try_load_native()
     if _C is not None and A.device.type == 'mps' and B.device.type == 'mps':
@@ -676,9 +680,9 @@ def matmul_4bit(
 
             # Call native fused kernel (NF4 or FP4)
             if quant_state.quant_type == "nf4":
-                output = _C.matmul_nf4(A_2d, weight_2d, absmax_2d, bias, blocksize, A_2d.dtype)
+                output = _C.matmul_nf4(A_2d, weight_2d, absmax_2d, bias, blocksize, compute_dtype)
             else:  # fp4
-                output = _C.matmul_fp4(A_2d, weight_2d, absmax_2d, bias, blocksize, A_2d.dtype)
+                output = _C.matmul_fp4(A_2d, weight_2d, absmax_2d, bias, blocksize, compute_dtype)
 
             if len(orig_shape) > 2:
                 output = output.reshape(*orig_shape[:-1], -1)
@@ -693,12 +697,17 @@ def matmul_4bit(
     if A.dim() > 2:
         A = A.reshape(-1, A.shape[-1])
 
-    output = torch.nn.functional.linear(A.to(weight.dtype), weight, bias)
+    # MPS requires all dtypes to match
+    A = A.to(weight.dtype)
+    if bias is not None:
+        bias = bias.to(weight.dtype)
+    output = torch.nn.functional.linear(A, weight, bias)
 
     if len(orig_shape) > 2:
         output = output.reshape(*orig_shape[:-1], -1)
 
-    return output
+    # Cast to compute_dtype
+    return output.to(compute_dtype)
 
 
 def matmul_nf4(input: Tensor, weight_packed: Tensor, weight_state: QuantState,

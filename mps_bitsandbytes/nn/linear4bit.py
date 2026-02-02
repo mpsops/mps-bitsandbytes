@@ -109,7 +109,8 @@ class Linear4bit(nn.Module):
             x = x.reshape(-1, self.in_features)
 
         # Fused 4-bit matmul (dequantize + matmul)
-        output = matmul_4bit(x, self.weight, self.weight_quant_state, self.bias)
+        output = matmul_4bit(x, self.weight, self.weight_quant_state, self.bias,
+                             compute_dtype=self.compute_dtype)
 
         # Restore batch dimensions
         if len(orig_shape) > 2:
