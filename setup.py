@@ -50,7 +50,7 @@ def get_extensions():
 
 setup(
     name="mps-bitsandbytes",
-    version="0.2.0",
+    version="0.6.1",
     description="4-bit NF4 and 8-bit quantization for PyTorch on Apple Silicon",
     packages=find_packages(exclude=['tests', 'tests.*']),
     package_data={

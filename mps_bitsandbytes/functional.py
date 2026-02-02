@@ -749,8 +749,10 @@ def matmul_4bit(
 
             return output
 
-    # Python fallback: Dequantize weights then matmul
-    _warn_native_fallback("matmul_4bit")
+    # Dequantize + matmul path (used for M > 512 where PyTorch GEMM is faster, or when native unavailable)
+    _C = _try_load_native()
+    if _C is None or A.device.type != 'mps' or B.device.type != 'mps':
+        _warn_native_fallback("matmul_4bit")
     weight = dequantize_4bit(B, quant_state)
 
     # Reshape for matmul if needed
