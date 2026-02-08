@@ -962,6 +962,13 @@ def spmm_coo(
 
     Computes: sparse @ dense where sparse is in COO format.
     """
+    _C = _try_load_native()
+    if _C is not None and dense.device.type == 'mps':
+        try:
+            return _C.spmm_coo(row_indices, col_indices, values, dense, sparse_rows, sparse_cols)
+        except Exception:
+            pass  # Fall through to PyTorch path
+
     indices = torch.stack([row_indices, col_indices], dim=0)
     sparse = torch.sparse_coo_tensor(
         indices, values,
@@ -983,6 +990,13 @@ def spmm_coo_int8(
     dtype: torch.dtype = torch.float16,
 ) -> Tensor:
     """Sparse-dense matrix multiplication with INT8 sparse values."""
+    _C = _try_load_native()
+    if _C is not None and dense.device.type == 'mps':
+        try:
+            return _C.spmm_coo_int8(row_indices, col_indices, values_int8, values_scale, dense, sparse_rows, sparse_cols)
+        except Exception:
+            pass  # Fall through to PyTorch path
+
     scale = values_scale.item() if values_scale.numel() == 1 else values_scale.to(dtype)
     values = values_int8.to(dtype) * scale
     return spmm_coo(row_indices, col_indices, values, dense.to(dtype), sparse_rows, sparse_cols)

@@ -11,6 +11,8 @@ from typing import Tuple, Optional, Callable
 import threading
 import warnings
 
+from ..functional import _try_load_native
+
 
 def quantize_state(state: torch.Tensor, block_size: int = 256) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize optimizer state to int8 with blockwise scaling."""
@@ -230,7 +232,23 @@ class Adam8bit(Optimizer):
 
                 state['step'] += 1
 
-                # Dequantize states (always in FP32 for numerical stability)
+                # Try native Metal kernel
+                _C = _try_load_native()
+                if _C is not None and p.device.type == 'mps' and p.dtype == torch.float16:
+                    try:
+                        _C.adam8bit_step(
+                            p.data, grad,
+                            state['exp_avg_int8'], state['exp_avg_absmax'],
+                            state['exp_avg_sq_uint8'], state['exp_avg_sq_max'],
+                            beta1, beta2, group['eps'], group['lr'],
+                            group['weight_decay'], state['step'], block_size,
+                            False,  # is_adamw=False for Adam
+                        )
+                        continue
+                    except Exception:
+                        pass  # Fall through to Python path
+
+                # Python fallback
                 exp_avg = dequantize_state(
                     state['exp_avg_int8'], state['exp_avg_absmax'],
                     block_size, torch.float32
@@ -357,7 +375,23 @@ class AdamW8bit(Optimizer):
 
                 state['step'] += 1
 
-                # Dequantize states (always in FP32 for numerical stability)
+                # Try native Metal kernel
+                _C = _try_load_native()
+                if _C is not None and p.device.type == 'mps' and p.dtype == torch.float16:
+                    try:
+                        _C.adam8bit_step(
+                            p.data, grad,
+                            state['exp_avg_int8'], state['exp_avg_absmax'],
+                            state['exp_avg_sq_uint8'], state['exp_avg_sq_max'],
+                            beta1, beta2, group['eps'], group['lr'],
+                            group['weight_decay'], state['step'], block_size,
+                            True,  # is_adamw=True for AdamW
+                        )
+                        continue
+                    except Exception:
+                        pass  # Fall through to Python path
+
+                # Python fallback
                 exp_avg = dequantize_state(
                     state['exp_avg_int8'], state['exp_avg_absmax'],
                     block_size, torch.float32

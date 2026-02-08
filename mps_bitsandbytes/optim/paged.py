@@ -73,7 +73,7 @@ class PagedAdamW(Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
-        """Performs a single optimization step."""
+        """Performs a single optimization step with async prefetching."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -90,10 +90,33 @@ class PagedAdamW(Optimizer):
             beta1, beta2 = group['betas']
             page_to_cpu = group['page_to_cpu']
 
-            for p in group['params']:
-                if p.grad is None:
-                    continue
+            # Collect params needing steps for prefetch optimization
+            params_with_grad = [p for p in group['params'] if p.grad is not None]
+            if not params_with_grad:
+                continue
 
+            # Batch small params (numel < 32768) for efficient transfer
+            small_params: List[torch.Tensor] = []
+            large_params: List[torch.Tensor] = []
+            for p in params_with_grad:
+                if p.numel() < 32768:
+                    small_params.append(p)
+                else:
+                    large_params.append(p)
+
+            # Prefetch first large param's states
+            prefetched_states: Optional[Dict[str, Any]] = None
+            if page_to_cpu and large_params:
+                state = self.state[large_params[0]]
+                if len(state) > 0:
+                    prefetched_states = {
+                        'exp_avg': state['exp_avg'].to(large_params[0].device, non_blocking=True),
+                        'exp_avg_sq': state['exp_avg_sq'].to(large_params[0].device, non_blocking=True),
+                        'param': large_params[0],
+                    }
+
+            # Process large params with prefetch overlap
+            for i, p in enumerate(large_params):
                 grad = p.grad
                 if grad.is_sparse:
                     raise RuntimeError("PagedAdamW does not support sparse gradients")
@@ -101,20 +124,72 @@ class PagedAdamW(Optimizer):
                 has_mps_params = has_mps_params or (p.device.type == 'mps')
                 state = self.state[p]
 
-                # State initialization
                 if len(state) == 0:
                     state['step'] = 0
                     storage_device = 'cpu' if page_to_cpu else p.device
-                    state['exp_avg'] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format, device=storage_device
-                    )
-                    state['exp_avg_sq'] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format, device=storage_device
-                    )
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format, device=storage_device)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format, device=storage_device)
 
                 state['step'] += 1
 
-                # Page in states (blocking - need data now)
+                # Use prefetched states if available for this param
+                if prefetched_states is not None and prefetched_states['param'] is p:
+                    exp_avg = prefetched_states['exp_avg']
+                    exp_avg_sq = prefetched_states['exp_avg_sq']
+                elif page_to_cpu:
+                    exp_avg = state['exp_avg'].to(p.device)
+                    exp_avg_sq = state['exp_avg_sq'].to(p.device)
+                else:
+                    exp_avg = state['exp_avg']
+                    exp_avg_sq = state['exp_avg_sq']
+
+                # Start prefetching NEXT param's states (overlap with compute)
+                prefetched_states = None
+                if page_to_cpu and i + 1 < len(large_params):
+                    next_p = large_params[i + 1]
+                    next_state = self.state[next_p]
+                    if len(next_state) > 0:
+                        prefetched_states = {
+                            'exp_avg': next_state['exp_avg'].to(next_p.device, non_blocking=True),
+                            'exp_avg_sq': next_state['exp_avg_sq'].to(next_p.device, non_blocking=True),
+                            'param': next_p,
+                        }
+
+                # Decoupled weight decay
+                if group['weight_decay'] != 0:
+                    p.mul_(1 - group['lr'] * group['weight_decay'])
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+
+                step_size = group['lr'] / bias_correction1
+                denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(group['eps'])
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+
+                if page_to_cpu:
+                    state['exp_avg'] = exp_avg.to('cpu', non_blocking=True)
+                    state['exp_avg_sq'] = exp_avg_sq.to('cpu', non_blocking=True)
+
+            # Process small params (simple loop, no prefetch overhead)
+            for p in small_params:
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("PagedAdamW does not support sparse gradients")
+
+                has_mps_params = has_mps_params or (p.device.type == 'mps')
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    storage_device = 'cpu' if page_to_cpu else p.device
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format, device=storage_device)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format, device=storage_device)
+
+                state['step'] += 1
+
                 if page_to_cpu:
                     exp_avg = state['exp_avg'].to(p.device)
                     exp_avg_sq = state['exp_avg_sq'].to(p.device)
@@ -122,25 +197,18 @@ class PagedAdamW(Optimizer):
                     exp_avg = state['exp_avg']
                     exp_avg_sq = state['exp_avg_sq']
 
-                # Decoupled weight decay
                 if group['weight_decay'] != 0:
                     p.mul_(1 - group['lr'] * group['weight_decay'])
 
-                # Update biased first moment estimate
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                # Update biased second raw moment estimate
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                # Bias correction
                 bias_correction1 = 1 - beta1 ** state['step']
                 bias_correction2 = 1 - beta2 ** state['step']
-
-                # Compute step
                 step_size = group['lr'] / bias_correction1
                 denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(group['eps'])
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
-                # Page out states (async - don't need data until next step)
                 if page_to_cpu:
                     state['exp_avg'] = exp_avg.to('cpu', non_blocking=True)
                     state['exp_avg_sq'] = exp_avg_sq.to('cpu', non_blocking=True)
@@ -288,7 +356,7 @@ class PagedLion(Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
-        """Performs a single optimization step."""
+        """Performs a single optimization step with async prefetching."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -305,10 +373,20 @@ class PagedLion(Optimizer):
             beta1, beta2 = group['betas']
             page_to_cpu = group['page_to_cpu']
 
-            for p in group['params']:
-                if p.grad is None:
-                    continue
+            params_with_grad = [p for p in group['params'] if p.grad is not None]
+            if not params_with_grad:
+                continue
 
+            # Prefetch first param's states
+            prefetched_exp_avg: Optional[torch.Tensor] = None
+            prefetched_param: Optional[torch.Tensor] = None
+            if page_to_cpu and params_with_grad:
+                state = self.state[params_with_grad[0]]
+                if len(state) > 0:
+                    prefetched_exp_avg = state['exp_avg'].to(params_with_grad[0].device, non_blocking=True)
+                    prefetched_param = params_with_grad[0]
+
+            for i, p in enumerate(params_with_grad):
                 grad = p.grad
                 has_mps_params = has_mps_params or (p.device.type == 'mps')
                 state = self.state[p]
@@ -319,11 +397,23 @@ class PagedLion(Optimizer):
                         p, memory_format=torch.preserve_format, device=storage_device
                     )
 
-                # Page in
-                if page_to_cpu:
+                # Use prefetched state if available
+                if prefetched_exp_avg is not None and prefetched_param is p:
+                    exp_avg = prefetched_exp_avg
+                elif page_to_cpu:
                     exp_avg = state['exp_avg'].to(p.device)
                 else:
                     exp_avg = state['exp_avg']
+
+                # Start prefetching NEXT param's states
+                prefetched_exp_avg = None
+                prefetched_param = None
+                if page_to_cpu and i + 1 < len(params_with_grad):
+                    next_p = params_with_grad[i + 1]
+                    next_state = self.state[next_p]
+                    if len(next_state) > 0:
+                        prefetched_exp_avg = next_state['exp_avg'].to(next_p.device, non_blocking=True)
+                        prefetched_param = next_p
 
                 # Weight decay
                 if group['weight_decay'] != 0:

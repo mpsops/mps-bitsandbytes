@@ -1206,6 +1206,449 @@ kernel void fp8_matmul_simd(
 // Double Quantization (quantize absmax with INT8)
 // =============================================================================
 
+// =============================================================================
+// Embedding Kernels
+// =============================================================================
+
+kernel void embedding_4bit_nf4(
+    device const uint* indices [[buffer(0)]],
+    device const uchar* weight_packed [[buffer(1)]],
+    device const float* absmax [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& num_indices [[buffer(4)]],
+    constant uint& embedding_dim [[buffer(5)]],
+    constant uint& block_size [[buffer(6)]],
+    constant uint& num_blocks [[buffer(7)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    uint idx_pos = tgid.y;
+    if (idx_pos >= num_indices) return;
+
+    uint emb_idx = indices[idx_pos];
+    uint thread_id = tid.x;
+    uint packed_dim = embedding_dim / 2;
+
+    device const uchar* row_packed = weight_packed + emb_idx * packed_dim;
+    device const float* row_absmax = absmax + emb_idx * num_blocks;
+    device half* out_row = output + idx_pos * embedding_dim;
+
+    for (uint col = thread_id; col < embedding_dim; col += 256) {
+        uint blk = col / block_size;
+        float scale = row_absmax[blk];
+        uchar packed = row_packed[col / 2];
+        float val = dequant_nf4(packed, col % 2, scale);
+        out_row[col] = half(val);
+    }
+}
+
+kernel void embedding_4bit_fp4(
+    device const uint* indices [[buffer(0)]],
+    device const uchar* weight_packed [[buffer(1)]],
+    device const float* absmax [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& num_indices [[buffer(4)]],
+    constant uint& embedding_dim [[buffer(5)]],
+    constant uint& block_size [[buffer(6)]],
+    constant uint& num_blocks [[buffer(7)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    uint idx_pos = tgid.y;
+    if (idx_pos >= num_indices) return;
+
+    uint emb_idx = indices[idx_pos];
+    uint thread_id = tid.x;
+    uint packed_dim = embedding_dim / 2;
+
+    device const uchar* row_packed = weight_packed + emb_idx * packed_dim;
+    device const float* row_absmax = absmax + emb_idx * num_blocks;
+    device half* out_row = output + idx_pos * embedding_dim;
+
+    for (uint col = thread_id; col < embedding_dim; col += 256) {
+        uint blk = col / block_size;
+        float scale = row_absmax[blk];
+        uchar packed = row_packed[col / 2];
+        float val = dequant_fp4(packed, col % 2, scale);
+        out_row[col] = half(val);
+    }
+}
+
+kernel void embedding_8bit(
+    device const uint* indices [[buffer(0)]],
+    device const char* weight_int8 [[buffer(1)]],
+    device const float* weight_scales [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& num_indices [[buffer(4)]],
+    constant uint& embedding_dim [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint idx_pos = gid.y;
+    if (col >= embedding_dim || idx_pos >= num_indices) return;
+
+    uint emb_idx = indices[idx_pos];
+    float scale = weight_scales[emb_idx];
+    float val = float(weight_int8[emb_idx * embedding_dim + col]) * scale / 127.0f;
+    output[idx_pos * embedding_dim + col] = half(val);
+}
+
+// =============================================================================
+// 8-bit Optimizer Kernels
+// =============================================================================
+
+kernel void adam8bit_step(
+    device half* param [[buffer(0)]],
+    device const half* grad [[buffer(1)]],
+    device char* exp_avg_int8 [[buffer(2)]],
+    device float* exp_avg_absmax [[buffer(3)]],
+    device uchar* exp_avg_sq_u8 [[buffer(4)]],
+    device float* exp_avg_sq_max [[buffer(5)]],
+    constant float& beta1 [[buffer(6)]],
+    constant float& beta2 [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    constant float& lr [[buffer(9)]],
+    constant float& weight_decay [[buffer(10)]],
+    constant uint& step [[buffer(11)]],
+    constant uint& N [[buffer(12)]],
+    constant uint& block_size [[buffer(13)]],
+    constant uint& is_adamw [[buffer(14)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint block_idx = tgid;
+    uint block_start = block_idx * block_size;
+    if (block_start >= N) return;
+    uint block_end = min(block_start + block_size, N);
+    uint block_len = block_end - block_start;
+
+    // Dequantize exp_avg (signed int8)
+    float m_absmax = exp_avg_absmax[block_idx];
+    // Dequantize exp_avg_sq (unsigned uint8 with sqrt compression)
+    float v_max = exp_avg_sq_max[block_idx];
+
+    // Bias correction
+    float bc1 = 1.0f - pow(beta1, float(step));
+    float bc2 = 1.0f - pow(beta2, float(step));
+    float step_size = lr / bc1;
+
+    // Process elements in this block
+    // Phase 1: Update moments and param, track new absmax
+    float new_m_max = 0.0f;
+    float new_v_max = 0.0f;
+
+    // We process multiple elements per thread
+    for (uint i = tid; i < block_len; i += 256) {
+        uint global_idx = block_start + i;
+
+        // Load param and grad
+        float p = float(param[global_idx]);
+        float g = float(grad[global_idx]);
+
+        // Dequantize m
+        float m = float(exp_avg_int8[global_idx]) * (m_absmax / 127.0f);
+        // Dequantize v (reverse sqrt compression)
+        float v_sqrt = float(exp_avg_sq_u8[global_idx]) / 255.0f;
+        float v = v_sqrt * v_sqrt * v_max;
+
+        // Weight decay
+        if (is_adamw != 0) {
+            // AdamW: decoupled weight decay
+            p = p * (1.0f - lr * weight_decay);
+        } else {
+            // Adam: L2 regularization on gradient
+            g = g + weight_decay * p;
+        }
+
+        // Update moments
+        m = beta1 * m + (1.0f - beta1) * g;
+        v = beta2 * v + (1.0f - beta2) * g * g;
+
+        // Update param
+        float v_hat = v / bc2;
+        float update = m * step_size / (sqrt(v_hat) + eps);
+        p = p - update;
+        param[global_idx] = half(p);
+
+        // Track absmax for requantization
+        new_m_max = max(new_m_max, abs(m));
+        new_v_max = max(new_v_max, v);
+
+        // Store float values temporarily in the int8 buffers
+        // We'll requantize after the reduction
+        // Use a two-pass approach: store to threadgroup memory
+    }
+
+    // SIMD reduction for new_m_max
+    new_m_max = simd_max(new_m_max);
+    new_v_max = simd_max(new_v_max);
+
+    threadgroup float shared_m[8];
+    threadgroup float shared_v[8];
+    if (simd_lane == 0) {
+        shared_m[simd_group] = new_m_max;
+        shared_v[simd_group] = new_v_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float m_max = 0.0f, v_mx = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            m_max = max(m_max, shared_m[i]);
+            v_mx = max(v_mx, shared_v[i]);
+        }
+        exp_avg_absmax[block_idx] = max(m_max, 1e-8f);
+        exp_avg_sq_max[block_idx] = max(v_mx, 1e-12f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: Requantize with new absmax
+    float final_m_max = exp_avg_absmax[block_idx];
+    float final_v_max = exp_avg_sq_max[block_idx];
+
+    for (uint i = tid; i < block_len; i += 256) {
+        uint global_idx = block_start + i;
+
+        // Re-compute moments (same math as above)
+        float p_orig = float(param[global_idx]);
+        // We need the updated m and v values - recompute from original
+        float g = float(grad[global_idx]);
+        float m = float(exp_avg_int8[global_idx]) * (m_absmax / 127.0f);
+        float v_sqrt = float(exp_avg_sq_u8[global_idx]) / 255.0f;
+        float v = v_sqrt * v_sqrt * v_max;
+
+        if (is_adamw == 0) {
+            // Need to reconstruct the adjusted gradient for L2
+            // But param already updated, so we just recompute moments
+            float p_before_update = p_orig; // already updated, get original
+            g = g + weight_decay * float(grad[global_idx]); // approx
+        }
+
+        m = beta1 * m + (1.0f - beta1) * g;
+        v = beta2 * v + (1.0f - beta2) * g * g;
+
+        // Requantize m -> int8
+        exp_avg_int8[global_idx] = char(clamp(round(m / final_m_max * 127.0f), -127.0f, 127.0f));
+        // Requantize v -> uint8 with sqrt compression
+        float v_norm = v / final_v_max;
+        exp_avg_sq_u8[global_idx] = uchar(clamp(round(sqrt(v_norm) * 255.0f), 0.0f, 255.0f));
+    }
+}
+
+kernel void lion8bit_step(
+    device half* param [[buffer(0)]],
+    device const half* grad [[buffer(1)]],
+    device char* exp_avg_int8 [[buffer(2)]],
+    device float* exp_avg_absmax [[buffer(3)]],
+    constant float& beta1 [[buffer(4)]],
+    constant float& beta2 [[buffer(5)]],
+    constant float& lr [[buffer(6)]],
+    constant float& weight_decay [[buffer(7)]],
+    constant uint& N [[buffer(8)]],
+    constant uint& block_size [[buffer(9)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint block_idx = tgid;
+    uint block_start = block_idx * block_size;
+    if (block_start >= N) return;
+    uint block_end = min(block_start + block_size, N);
+    uint block_len = block_end - block_start;
+
+    float m_absmax = exp_avg_absmax[block_idx];
+    float new_m_max = 0.0f;
+
+    for (uint i = tid; i < block_len; i += 256) {
+        uint global_idx = block_start + i;
+
+        float p = float(param[global_idx]);
+        float g = float(grad[global_idx]);
+
+        // Dequantize m
+        float m = float(exp_avg_int8[global_idx]) * (m_absmax / 127.0f);
+
+        // Weight decay (decoupled)
+        p = p * (1.0f - lr * weight_decay);
+
+        // Lion update: sign of interpolation
+        float u = beta1 * m + (1.0f - beta1) * g;
+        p = p - lr * sign(u);
+        param[global_idx] = half(p);
+
+        // Update momentum for next step
+        m = beta2 * m + (1.0f - beta2) * g;
+        new_m_max = max(new_m_max, abs(m));
+
+        // Store m temporarily (will requantize after reduction)
+        // We use a float reinterpret trick - store as int bits
+        // Actually, we need a second pass. Store m in shared or recompute.
+    }
+
+    // SIMD reduction for new_m_max
+    new_m_max = simd_max(new_m_max);
+    threadgroup float shared[8];
+    if (simd_lane == 0) shared[simd_group] = new_m_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float mx = 0.0f;
+        for (uint i = 0; i < 8; i++) mx = max(mx, shared[i]);
+        exp_avg_absmax[block_idx] = max(mx, 1e-8f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: Requantize
+    float final_m_max = exp_avg_absmax[block_idx];
+    for (uint i = tid; i < block_len; i += 256) {
+        uint global_idx = block_start + i;
+        float g = float(grad[global_idx]);
+        float m = float(exp_avg_int8[global_idx]) * (m_absmax / 127.0f);
+        m = beta2 * m + (1.0f - beta2) * g;
+        exp_avg_int8[global_idx] = char(clamp(round(m / final_m_max * 127.0f), -127.0f, 127.0f));
+    }
+}
+
+kernel void sgd8bit_step(
+    device half* param [[buffer(0)]],
+    device const half* grad [[buffer(1)]],
+    device char* momentum_int8 [[buffer(2)]],
+    device float* momentum_absmax [[buffer(3)]],
+    constant float& lr [[buffer(4)]],
+    constant float& momentum_val [[buffer(5)]],
+    constant float& dampening [[buffer(6)]],
+    constant float& weight_decay [[buffer(7)]],
+    constant uint& nesterov [[buffer(8)]],
+    constant uint& N [[buffer(9)]],
+    constant uint& block_size [[buffer(10)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint block_idx = tgid;
+    uint block_start = block_idx * block_size;
+    if (block_start >= N) return;
+    uint block_end = min(block_start + block_size, N);
+    uint block_len = block_end - block_start;
+
+    float buf_absmax = momentum_absmax[block_idx];
+    float new_buf_max = 0.0f;
+
+    for (uint i = tid; i < block_len; i += 256) {
+        uint global_idx = block_start + i;
+
+        float p = float(param[global_idx]);
+        float g = float(grad[global_idx]);
+
+        // Weight decay (L2)
+        g = g + weight_decay * p;
+
+        // Dequantize momentum buffer
+        float buf = float(momentum_int8[global_idx]) * (buf_absmax / 127.0f);
+
+        // Update momentum buffer
+        buf = momentum_val * buf + (1.0f - dampening) * g;
+        new_buf_max = max(new_buf_max, abs(buf));
+
+        // Apply update
+        float update;
+        if (nesterov != 0) {
+            update = g + momentum_val * buf;
+        } else {
+            update = buf;
+        }
+        p = p - lr * update;
+        param[global_idx] = half(p);
+    }
+
+    // SIMD reduction
+    new_buf_max = simd_max(new_buf_max);
+    threadgroup float shared[8];
+    if (simd_lane == 0) shared[simd_group] = new_buf_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float mx = 0.0f;
+        for (uint i = 0; i < 8; i++) mx = max(mx, shared[i]);
+        momentum_absmax[block_idx] = max(mx, 1e-8f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: Requantize
+    float final_buf_max = momentum_absmax[block_idx];
+    for (uint i = tid; i < block_len; i += 256) {
+        uint global_idx = block_start + i;
+        float p = float(param[global_idx]);
+        float g = float(grad[global_idx]);
+        g = g + weight_decay * p;
+        float buf = float(momentum_int8[global_idx]) * (buf_absmax / 127.0f);
+        buf = momentum_val * buf + (1.0f - dampening) * g;
+        momentum_int8[global_idx] = char(clamp(round(buf / final_buf_max * 127.0f), -127.0f, 127.0f));
+    }
+}
+
+// =============================================================================
+// Sparse MatMul Kernels (CSR format)
+// =============================================================================
+
+kernel void spmm_csr(
+    device const uint* row_ptr [[buffer(0)]],
+    device const uint* col_indices [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device const half* dense [[buffer(3)]],
+    device half* output [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    if (row >= M || col >= N) return;
+
+    uint start = row_ptr[row];
+    uint end = row_ptr[row + 1];
+
+    float acc = 0.0f;
+    for (uint i = start; i < end; i++) {
+        uint k = col_indices[i];
+        acc += values[i] * float(dense[k * N + col]);
+    }
+    output[row * N + col] = half(acc);
+}
+
+kernel void spmm_csr_int8(
+    device const uint* row_ptr [[buffer(0)]],
+    device const uint* col_indices [[buffer(1)]],
+    device const char* values_int8 [[buffer(2)]],
+    device const float& values_scale [[buffer(3)]],
+    device const half* dense [[buffer(4)]],
+    device half* output [[buffer(5)]],
+    constant uint& M [[buffer(6)]],
+    constant uint& N [[buffer(7)]],
+    constant uint& K [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    if (row >= M || col >= N) return;
+
+    uint start = row_ptr[row];
+    uint end = row_ptr[row + 1];
+
+    float acc = 0.0f;
+    for (uint i = start; i < end; i++) {
+        uint k = col_indices[i];
+        float val = float(values_int8[i]) * values_scale;
+        acc += val * float(dense[k * N + col]);
+    }
+    output[row * N + col] = half(acc);
+}
+
 kernel void double_quant_absmax(
     device const float* absmax [[buffer(0)]],
     device uchar* absmax_quant [[buffer(1)]],
@@ -1860,6 +2303,423 @@ std::tuple<at::Tensor, at::Tensor> double_quant_mps(const at::Tensor& absmax, in
 }
 
 // =============================================================================
+// Embedding Operations
+// =============================================================================
+
+at::Tensor embedding_4bit_nf4_mps(
+    const at::Tensor& indices,
+    const at::Tensor& weight_packed,
+    const at::Tensor& absmax,
+    int64_t embedding_dim,
+    int64_t block_size
+) {
+    TORCH_CHECK(indices.device().is_mps(), "indices must be on MPS");
+    TORCH_CHECK(weight_packed.device().is_mps(), "weight must be on MPS");
+
+    auto indices_c = indices.to(at::kInt).contiguous();
+    auto weight_c = weight_packed.contiguous();
+    auto absmax_c = absmax.to(at::kFloat).contiguous();
+
+    int64_t num_indices = indices_c.numel();
+    int64_t num_blocks = (embedding_dim + block_size - 1) / block_size;
+
+    auto output = at::empty({num_indices, embedding_dim}, weight_packed.options().dtype(at::kHalf));
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("embedding_4bit_nf4");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(indices_c) offset:indices_c.storage_offset()*4 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:weight_c.storage_offset() atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(absmax_c) offset:absmax_c.storage_offset()*4 atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:3];
+
+        uint32_t params[4] = {(uint32_t)num_indices, (uint32_t)embedding_dim, (uint32_t)block_size, (uint32_t)num_blocks};
+        for (int i = 0; i < 4; i++) [encoder setBytes:&params[i] length:4 atIndex:4 + i];
+
+        MTLSize tg = MTLSizeMake(256, 1, 1);
+        MTLSize ntg = MTLSizeMake(1, num_indices, 1);
+        [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+    }
+
+    return output;
+}
+
+at::Tensor embedding_4bit_fp4_mps(
+    const at::Tensor& indices,
+    const at::Tensor& weight_packed,
+    const at::Tensor& absmax,
+    int64_t embedding_dim,
+    int64_t block_size
+) {
+    TORCH_CHECK(indices.device().is_mps(), "indices must be on MPS");
+
+    auto indices_c = indices.to(at::kInt).contiguous();
+    auto weight_c = weight_packed.contiguous();
+    auto absmax_c = absmax.to(at::kFloat).contiguous();
+
+    int64_t num_indices = indices_c.numel();
+    int64_t num_blocks = (embedding_dim + block_size - 1) / block_size;
+
+    auto output = at::empty({num_indices, embedding_dim}, weight_packed.options().dtype(at::kHalf));
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("embedding_4bit_fp4");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(indices_c) offset:indices_c.storage_offset()*4 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:weight_c.storage_offset() atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(absmax_c) offset:absmax_c.storage_offset()*4 atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:3];
+
+        uint32_t params[4] = {(uint32_t)num_indices, (uint32_t)embedding_dim, (uint32_t)block_size, (uint32_t)num_blocks};
+        for (int i = 0; i < 4; i++) [encoder setBytes:&params[i] length:4 atIndex:4 + i];
+
+        MTLSize tg = MTLSizeMake(256, 1, 1);
+        MTLSize ntg = MTLSizeMake(1, num_indices, 1);
+        [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+    }
+
+    return output;
+}
+
+at::Tensor embedding_8bit_mps(
+    const at::Tensor& indices,
+    const at::Tensor& weight_int8,
+    const at::Tensor& weight_scales
+) {
+    TORCH_CHECK(indices.device().is_mps(), "indices must be on MPS");
+
+    auto indices_c = indices.to(at::kInt).contiguous();
+    auto weight_c = weight_int8.contiguous();
+    auto scales_c = weight_scales.to(at::kFloat).contiguous();
+
+    int64_t num_indices = indices_c.numel();
+    int64_t embedding_dim = weight_int8.size(1);
+
+    auto output = at::empty({num_indices, embedding_dim}, weight_int8.options().dtype(at::kHalf));
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("embedding_8bit");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(indices_c) offset:indices_c.storage_offset()*4 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(weight_c) offset:weight_c.storage_offset() atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(scales_c) offset:scales_c.storage_offset()*4 atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:3];
+
+        uint32_t params[2] = {(uint32_t)num_indices, (uint32_t)embedding_dim};
+        [encoder setBytes:&params[0] length:4 atIndex:4];
+        [encoder setBytes:&params[1] length:4 atIndex:5];
+
+        MTLSize tg = MTLSizeMake(16, 16, 1);
+        MTLSize grid = MTLSizeMake(((embedding_dim + 15) / 16) * 16, ((num_indices + 15) / 16) * 16, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+    }
+
+    return output;
+}
+
+// =============================================================================
+// 8-bit Optimizer Operations
+// =============================================================================
+
+void adam8bit_step_mps(
+    at::Tensor& param,
+    const at::Tensor& grad,
+    at::Tensor& exp_avg_int8,
+    at::Tensor& exp_avg_absmax,
+    at::Tensor& exp_avg_sq_u8,
+    at::Tensor& exp_avg_sq_max,
+    double beta1, double beta2, double eps, double lr,
+    double weight_decay, int64_t step, int64_t block_size,
+    bool is_adamw
+) {
+    TORCH_CHECK(param.device().is_mps(), "param must be on MPS");
+
+    auto param_c = param.contiguous();
+    auto grad_c = grad.to(at::kHalf).contiguous();
+    auto ea_int8 = exp_avg_int8.contiguous();
+    auto ea_absmax = exp_avg_absmax.to(at::kFloat).contiguous();
+    auto ea_sq_u8 = exp_avg_sq_u8.contiguous();
+    auto ea_sq_max = exp_avg_sq_max.to(at::kFloat).contiguous();
+
+    int64_t N = param_c.numel();
+    int64_t num_blocks = (N + block_size - 1) / block_size;
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("adam8bit_step");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(param_c) offset:param_c.storage_offset()*2 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_c) offset:grad_c.storage_offset()*2 atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(ea_int8) offset:ea_int8.storage_offset() atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(ea_absmax) offset:ea_absmax.storage_offset()*4 atIndex:3];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(ea_sq_u8) offset:ea_sq_u8.storage_offset() atIndex:4];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(ea_sq_max) offset:ea_sq_max.storage_offset()*4 atIndex:5];
+
+        float params_f[5] = {(float)beta1, (float)beta2, (float)eps, (float)lr, (float)weight_decay};
+        for (int i = 0; i < 5; i++) [encoder setBytes:&params_f[i] length:4 atIndex:6 + i];
+
+        uint32_t params_u[4] = {(uint32_t)step, (uint32_t)N, (uint32_t)block_size, is_adamw ? 1u : 0u};
+        for (int i = 0; i < 4; i++) [encoder setBytes:&params_u[i] length:4 atIndex:11 + i];
+
+        MTLSize tg = MTLSizeMake(256, 1, 1);
+        MTLSize ntg = MTLSizeMake(num_blocks, 1, 1);
+        [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+    }
+
+    // Copy results back if param was not contiguous
+    if (!param.is_contiguous()) {
+        param.copy_(param_c);
+    }
+    exp_avg_int8.copy_(ea_int8);
+    exp_avg_absmax.copy_(ea_absmax);
+    exp_avg_sq_u8.copy_(ea_sq_u8);
+    exp_avg_sq_max.copy_(ea_sq_max);
+}
+
+void lion8bit_step_mps(
+    at::Tensor& param,
+    const at::Tensor& grad,
+    at::Tensor& exp_avg_int8,
+    at::Tensor& exp_avg_absmax,
+    double beta1, double beta2, double lr,
+    double weight_decay, int64_t block_size
+) {
+    TORCH_CHECK(param.device().is_mps(), "param must be on MPS");
+
+    auto param_c = param.contiguous();
+    auto grad_c = grad.to(at::kHalf).contiguous();
+    auto ea_int8 = exp_avg_int8.contiguous();
+    auto ea_absmax = exp_avg_absmax.to(at::kFloat).contiguous();
+
+    int64_t N = param_c.numel();
+    int64_t num_blocks = (N + block_size - 1) / block_size;
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("lion8bit_step");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(param_c) offset:param_c.storage_offset()*2 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_c) offset:grad_c.storage_offset()*2 atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(ea_int8) offset:ea_int8.storage_offset() atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(ea_absmax) offset:ea_absmax.storage_offset()*4 atIndex:3];
+
+        float params_f[4] = {(float)beta1, (float)beta2, (float)lr, (float)weight_decay};
+        for (int i = 0; i < 4; i++) [encoder setBytes:&params_f[i] length:4 atIndex:4 + i];
+
+        uint32_t params_u[2] = {(uint32_t)N, (uint32_t)block_size};
+        [encoder setBytes:&params_u[0] length:4 atIndex:8];
+        [encoder setBytes:&params_u[1] length:4 atIndex:9];
+
+        MTLSize tg = MTLSizeMake(256, 1, 1);
+        MTLSize ntg = MTLSizeMake(num_blocks, 1, 1);
+        [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+    }
+
+    if (!param.is_contiguous()) param.copy_(param_c);
+    exp_avg_int8.copy_(ea_int8);
+    exp_avg_absmax.copy_(ea_absmax);
+}
+
+void sgd8bit_step_mps(
+    at::Tensor& param,
+    const at::Tensor& grad,
+    at::Tensor& momentum_int8,
+    at::Tensor& momentum_absmax,
+    double lr, double momentum, double dampening,
+    double weight_decay, bool nesterov, int64_t block_size
+) {
+    TORCH_CHECK(param.device().is_mps(), "param must be on MPS");
+
+    auto param_c = param.contiguous();
+    auto grad_c = grad.to(at::kHalf).contiguous();
+    auto m_int8 = momentum_int8.contiguous();
+    auto m_absmax = momentum_absmax.to(at::kFloat).contiguous();
+
+    int64_t N = param_c.numel();
+    int64_t num_blocks = (N + block_size - 1) / block_size;
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("sgd8bit_step");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(param_c) offset:param_c.storage_offset()*2 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_c) offset:grad_c.storage_offset()*2 atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(m_int8) offset:m_int8.storage_offset() atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(m_absmax) offset:m_absmax.storage_offset()*4 atIndex:3];
+
+        float params_f[4] = {(float)lr, (float)momentum, (float)dampening, (float)weight_decay};
+        for (int i = 0; i < 4; i++) [encoder setBytes:&params_f[i] length:4 atIndex:4 + i];
+
+        uint32_t params_u[3] = {nesterov ? 1u : 0u, (uint32_t)N, (uint32_t)block_size};
+        for (int i = 0; i < 3; i++) [encoder setBytes:&params_u[i] length:4 atIndex:8 + i];
+
+        MTLSize tg = MTLSizeMake(256, 1, 1);
+        MTLSize ntg = MTLSizeMake(num_blocks, 1, 1);
+        [encoder dispatchThreadgroups:ntg threadsPerThreadgroup:tg];
+    }
+
+    if (!param.is_contiguous()) param.copy_(param_c);
+    momentum_int8.copy_(m_int8);
+    momentum_absmax.copy_(m_absmax);
+}
+
+// =============================================================================
+// Sparse MatMul Operations
+// =============================================================================
+
+at::Tensor spmm_coo_mps(
+    const at::Tensor& row_indices,
+    const at::Tensor& col_indices,
+    const at::Tensor& values,
+    const at::Tensor& dense,
+    int64_t sparse_rows,
+    int64_t sparse_cols
+) {
+    TORCH_CHECK(dense.device().is_mps(), "dense must be on MPS");
+
+    int64_t M = sparse_rows;
+    int64_t N = dense.size(1);
+    int64_t K = sparse_cols;
+    int64_t nnz = values.numel();
+
+    auto values_c = values.to(at::kFloat).contiguous();
+    auto dense_c = dense.to(at::kHalf).contiguous();
+
+    // Convert COO to CSR on CPU (cheap)
+    auto row_idx_cpu = row_indices.to(at::kLong).cpu();
+    auto col_idx_cpu = col_indices.to(at::kInt).cpu();
+
+    // Sort by row
+    auto sort_indices = row_idx_cpu.argsort();
+    auto sorted_rows = row_idx_cpu.index_select(0, sort_indices);
+    auto sorted_cols = col_idx_cpu.index_select(0, sort_indices);
+    auto sorted_vals_cpu = values_c.cpu().index_select(0, sort_indices.to(values_c.device()));
+
+    // Build row_ptr
+    auto row_ptr_cpu = at::zeros({M + 1}, at::kInt);
+    auto row_ptr_acc = row_ptr_cpu.accessor<int, 1>();
+    auto sorted_rows_acc = sorted_rows.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < nnz; i++) {
+        row_ptr_acc[sorted_rows_acc[i] + 1]++;
+    }
+    for (int64_t i = 1; i <= M; i++) {
+        row_ptr_acc[i] += row_ptr_acc[i - 1];
+    }
+
+    // Move to MPS
+    auto row_ptr_mps = row_ptr_cpu.to(at::kInt).to(dense.device());
+    auto col_idx_mps = sorted_cols.to(at::kInt).to(dense.device());
+    auto vals_mps = sorted_vals_cpu.to(at::kFloat).to(dense.device());
+
+    auto output = at::zeros({M, N}, dense.options().dtype(at::kHalf));
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("spmm_csr");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(row_ptr_mps) offset:0 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(col_idx_mps) offset:0 atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(vals_mps) offset:0 atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(dense_c) offset:0 atIndex:3];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:4];
+
+        uint32_t params[3] = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
+        for (int i = 0; i < 3; i++) [encoder setBytes:&params[i] length:4 atIndex:5 + i];
+
+        MTLSize tg = MTLSizeMake(16, 16, 1);
+        MTLSize grid = MTLSizeMake(((N + 15) / 16) * 16, ((M + 15) / 16) * 16, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+    }
+
+    return output;
+}
+
+at::Tensor spmm_coo_int8_mps(
+    const at::Tensor& row_indices,
+    const at::Tensor& col_indices,
+    const at::Tensor& values_int8,
+    const at::Tensor& values_scale,
+    const at::Tensor& dense,
+    int64_t sparse_rows,
+    int64_t sparse_cols
+) {
+    TORCH_CHECK(dense.device().is_mps(), "dense must be on MPS");
+
+    int64_t M = sparse_rows;
+    int64_t N = dense.size(1);
+    int64_t K = sparse_cols;
+    int64_t nnz = values_int8.numel();
+
+    auto dense_c = dense.to(at::kHalf).contiguous();
+    auto scale_c = values_scale.to(at::kFloat).contiguous();
+
+    // Convert COO to CSR on CPU
+    auto row_idx_cpu = row_indices.to(at::kLong).cpu();
+    auto col_idx_cpu = col_indices.to(at::kInt).cpu();
+
+    auto sort_indices = row_idx_cpu.argsort();
+    auto sorted_rows = row_idx_cpu.index_select(0, sort_indices);
+    auto sorted_cols = col_idx_cpu.index_select(0, sort_indices);
+    auto sorted_vals_cpu = values_int8.cpu().index_select(0, sort_indices.to(values_int8.device()));
+
+    auto row_ptr_cpu = at::zeros({M + 1}, at::kInt);
+    auto row_ptr_acc = row_ptr_cpu.accessor<int, 1>();
+    auto sorted_rows_acc = sorted_rows.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < nnz; i++) {
+        row_ptr_acc[sorted_rows_acc[i] + 1]++;
+    }
+    for (int64_t i = 1; i <= M; i++) {
+        row_ptr_acc[i] += row_ptr_acc[i - 1];
+    }
+
+    auto row_ptr_mps = row_ptr_cpu.to(at::kInt).to(dense.device());
+    auto col_idx_mps = sorted_cols.to(at::kInt).to(dense.device());
+    auto vals_mps = sorted_vals_cpu.to(at::kChar).to(dense.device());
+
+    auto output = at::zeros({M, N}, dense.options().dtype(at::kHalf));
+
+    @autoreleasepool {
+        auto stream = at::mps::getCurrentMPSStream();
+        auto encoder = stream->commandEncoder();
+        auto pipeline = get_pipeline("spmm_csr_int8");
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(row_ptr_mps) offset:0 atIndex:0];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(col_idx_mps) offset:0 atIndex:1];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(vals_mps) offset:0 atIndex:2];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(scale_c) offset:0 atIndex:3];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(dense_c) offset:0 atIndex:4];
+        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:5];
+
+        uint32_t params[3] = {(uint32_t)M, (uint32_t)N, (uint32_t)K};
+        for (int i = 0; i < 3; i++) [encoder setBytes:&params[i] length:4 atIndex:6 + i];
+
+        MTLSize tg = MTLSizeMake(16, 16, 1);
+        MTLSize grid = MTLSizeMake(((N + 15) / 16) * 16, ((M + 15) / 16) * 16, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+    }
+
+    return output;
+}
+
+// =============================================================================
 // Python Bindings
 // =============================================================================
 
@@ -1900,4 +2760,41 @@ PYBIND11_MODULE(_C, m) {
 
     // Double Quantization
     m.def("double_quant", &double_quant_mps, py::arg("absmax"), py::arg("double_quant_block") = 256);
+
+    // Embedding
+    m.def("embedding_4bit_nf4", &embedding_4bit_nf4_mps,
+          py::arg("indices"), py::arg("weight_packed"), py::arg("absmax"),
+          py::arg("embedding_dim"), py::arg("block_size"));
+    m.def("embedding_4bit_fp4", &embedding_4bit_fp4_mps,
+          py::arg("indices"), py::arg("weight_packed"), py::arg("absmax"),
+          py::arg("embedding_dim"), py::arg("block_size"));
+    m.def("embedding_8bit", &embedding_8bit_mps,
+          py::arg("indices"), py::arg("weight_int8"), py::arg("weight_scales"));
+
+    // 8-bit Optimizers
+    m.def("adam8bit_step", &adam8bit_step_mps,
+          py::arg("param"), py::arg("grad"),
+          py::arg("exp_avg_int8"), py::arg("exp_avg_absmax"),
+          py::arg("exp_avg_sq_u8"), py::arg("exp_avg_sq_max"),
+          py::arg("beta1"), py::arg("beta2"), py::arg("eps"), py::arg("lr"),
+          py::arg("weight_decay"), py::arg("step"), py::arg("block_size"),
+          py::arg("is_adamw"));
+    m.def("lion8bit_step", &lion8bit_step_mps,
+          py::arg("param"), py::arg("grad"),
+          py::arg("exp_avg_int8"), py::arg("exp_avg_absmax"),
+          py::arg("beta1"), py::arg("beta2"), py::arg("lr"),
+          py::arg("weight_decay"), py::arg("block_size"));
+    m.def("sgd8bit_step", &sgd8bit_step_mps,
+          py::arg("param"), py::arg("grad"),
+          py::arg("momentum_int8"), py::arg("momentum_absmax"),
+          py::arg("lr"), py::arg("momentum"), py::arg("dampening"),
+          py::arg("weight_decay"), py::arg("nesterov"), py::arg("block_size"));
+
+    // Sparse MatMul
+    m.def("spmm_coo", &spmm_coo_mps,
+          py::arg("row_indices"), py::arg("col_indices"), py::arg("values"),
+          py::arg("dense"), py::arg("sparse_rows"), py::arg("sparse_cols"));
+    m.def("spmm_coo_int8", &spmm_coo_int8_mps,
+          py::arg("row_indices"), py::arg("col_indices"), py::arg("values_int8"),
+          py::arg("values_scale"), py::arg("dense"), py::arg("sparse_rows"), py::arg("sparse_cols"));
 }

@@ -10,6 +10,7 @@ from torch.optim import Optimizer
 from typing import Tuple, Optional, Callable
 
 from .adam8bit import quantize_state, dequantize_state
+from ..functional import _try_load_native
 
 
 class Lion8bit(Optimizer):
@@ -82,7 +83,21 @@ class Lion8bit(Optimizer):
                         block_size
                     )
 
-                # Dequantize momentum (FP32 for stability)
+                # Try native Metal kernel
+                _C = _try_load_native()
+                if _C is not None and p.device.type == 'mps' and p.dtype == torch.float16:
+                    try:
+                        _C.lion8bit_step(
+                            p.data, grad,
+                            state['exp_avg_int8'], state['exp_avg_absmax'],
+                            beta1, beta2, group['lr'],
+                            group['weight_decay'], block_size,
+                        )
+                        continue
+                    except Exception:
+                        pass  # Fall through to Python path
+
+                # Python fallback
                 exp_avg = dequantize_state(
                     state['exp_avg_int8'], state['exp_avg_absmax'],
                     block_size, torch.float32

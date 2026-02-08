@@ -7,6 +7,7 @@ from torch.optim import Optimizer
 from typing import Optional, Callable
 
 from .adam8bit import quantize_state, dequantize_state
+from ..functional import _try_load_native
 
 
 class SGD8bit(Optimizer):
@@ -85,6 +86,21 @@ class SGD8bit(Optimizer):
                             block_size
                         )
 
+                    # Try native Metal kernel
+                    _C = _try_load_native()
+                    if _C is not None and p.device.type == 'mps' and p.dtype == torch.float16:
+                        try:
+                            _C.sgd8bit_step(
+                                p.data, grad,
+                                state['momentum_int8'], state['momentum_absmax'],
+                                group['lr'], momentum, dampening,
+                                group['weight_decay'], nesterov, block_size,
+                            )
+                            continue
+                        except Exception:
+                            pass  # Fall through to Python path
+
+                    # Python fallback
                     buf = dequantize_state(
                         state['momentum_int8'], state['momentum_absmax'],
                         block_size, torch.float32

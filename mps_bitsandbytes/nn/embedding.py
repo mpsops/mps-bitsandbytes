@@ -13,7 +13,7 @@ from ..functional import (
     quantize_nf4, dequantize_nf4,
     quantize_fp4, dequantize_fp4,
     quantize_rowwise, dequantize_rowwise,
-    QuantState,
+    QuantState, _try_load_native,
 )
 
 
@@ -85,18 +85,36 @@ class Embedding4bit(nn.Module):
         Returns:
             Embedded tensor [*, seq_len, embedding_dim]
         """
-        # Get unique indices for efficient dequantization
         flat_input = input.flatten()
-        unique_indices, inverse = flat_input.unique(return_inverse=True)
 
-        # Dequantize only unique embeddings
+        # Try native Metal kernel (single dispatch for all indices)
+        _C = _try_load_native()
+        if _C is not None and flat_input.device.type == 'mps':
+            try:
+                kernel_fn = _C.embedding_4bit_nf4 if self.quant_type == 'nf4' else _C.embedding_4bit_fp4
+                output = kernel_fn(
+                    flat_input.int(),
+                    self.weight_packed,
+                    self.weight_absmax,
+                    self.embedding_dim,
+                    self.blocksize,
+                )
+                output_shape = list(input.shape) + [self.embedding_dim]
+                output = output.view(*output_shape)
+                if self.padding_idx is not None:
+                    mask = (input == self.padding_idx).unsqueeze(-1)
+                    output = output.masked_fill(mask, 0.0)
+                return output
+            except Exception:
+                pass  # Fall through to Python path
+
+        # Python fallback: dequantize unique embeddings one at a time
+        unique_indices, inverse = flat_input.unique(return_inverse=True)
         dequant_fn = dequantize_nf4 if self.quant_type == 'nf4' else dequantize_fp4
 
-        # Gather packed weights for unique indices
         packed = self.weight_packed[unique_indices]
         absmax = self.weight_absmax[unique_indices]
 
-        # Create QuantState for each row and dequantize
         embeddings_list = []
         for i in range(packed.shape[0]):
             quant_state = QuantState(
@@ -110,14 +128,10 @@ class Embedding4bit(nn.Module):
             embeddings_list.append(emb)
         embeddings = torch.stack(embeddings_list)
 
-        # Gather using inverse indices
         output = embeddings[inverse]
-
-        # Reshape to original input shape + embedding_dim
         output_shape = list(input.shape) + [self.embedding_dim]
         output = output.view(*output_shape)
 
-        # Handle padding_idx
         if self.padding_idx is not None:
             mask = (input == self.padding_idx).unsqueeze(-1)
             output = output.masked_fill(mask, 0.0)
@@ -229,14 +243,31 @@ class Embedding8bit(nn.Module):
 
     def forward(self, input: Tensor) -> Tensor:
         """Look up embeddings for input indices."""
-        # Gather int8 weights
-        weight_int8 = self.weight_int8[input]  # [*, seq_len, embed_dim]
-        scales = self.weight_scales[input]  # [*, seq_len]
+        flat_input = input.flatten()
 
-        # Dequantize
+        # Try native Metal kernel
+        _C = _try_load_native()
+        if _C is not None and flat_input.device.type == 'mps':
+            try:
+                output = _C.embedding_8bit(
+                    flat_input.int(),
+                    self.weight_int8,
+                    self.weight_scales,
+                )
+                output_shape = list(input.shape) + [self.embedding_dim]
+                output = output.view(*output_shape)
+                if self.padding_idx is not None:
+                    mask = (input == self.padding_idx).unsqueeze(-1)
+                    output = output.masked_fill(mask, 0.0)
+                return output
+            except Exception:
+                pass  # Fall through to Python path
+
+        # Python fallback
+        weight_int8 = self.weight_int8[input]
+        scales = self.weight_scales[input]
         output = weight_int8.to(self.dtype) * (scales.unsqueeze(-1) / 127.0).to(self.dtype)
 
-        # Handle padding_idx
         if self.padding_idx is not None:
             mask = (input == self.padding_idx).unsqueeze(-1)
             output = output.masked_fill(mask, 0.0)

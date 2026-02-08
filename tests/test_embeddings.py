@@ -196,5 +196,108 @@ class TestEmbeddingIntegration:
         assert proj.weight.grad.abs().sum() > 0
 
 
+class TestNativeVsFallbackEmbedding:
+    """Test that native Metal kernels produce same results as Python fallback."""
+
+    def _force_fallback_embedding4bit(self, embed_4bit, input):
+        """Run the Python fallback path explicitly."""
+        from mps_bitsandbytes.functional import dequantize_nf4, dequantize_fp4, QuantState
+        flat_input = input.flatten()
+        unique_indices, inverse = flat_input.unique(return_inverse=True)
+
+        dequant_fn = dequantize_nf4 if embed_4bit.quant_type == 'nf4' else dequantize_fp4
+        packed = embed_4bit.weight_packed[unique_indices]
+        absmax = embed_4bit.weight_absmax[unique_indices]
+
+        embeddings_list = []
+        for i in range(packed.shape[0]):
+            quant_state = QuantState(
+                absmax=absmax[i],
+                shape=torch.Size([embed_4bit.embedding_dim]),
+                blocksize=embed_4bit.blocksize,
+                quant_type=embed_4bit.quant_type,
+                dtype=embed_4bit.dtype,
+            )
+            emb = dequant_fn(packed[i], quant_state)
+            embeddings_list.append(emb)
+        embeddings = torch.stack(embeddings_list)
+        output = embeddings[inverse]
+        output_shape = list(input.shape) + [embed_4bit.embedding_dim]
+        return output.view(*output_shape)
+
+    def test_native_vs_fallback_embedding4bit_nf4(self, device):
+        """Compare native Metal kernel vs Python fallback for NF4 embedding."""
+        if device != 'mps':
+            pytest.skip("Native kernels require MPS")
+
+        vocab_size, embed_dim = 500, 128
+        embed = nn.Embedding(vocab_size, embed_dim).half().to(device)
+        embed_4bit = Embedding4bit.from_embedding(embed, quant_type='nf4', device=device)
+
+        indices = torch.randint(0, vocab_size, (4, 16), device=device)
+
+        native_output = embed_4bit(indices)
+        fallback_output = self._force_fallback_embedding4bit(embed_4bit, indices)
+
+        assert torch.allclose(native_output, fallback_output, atol=1e-3), \
+            f"Max diff: {(native_output - fallback_output).abs().max().item()}"
+
+    def test_native_vs_fallback_embedding4bit_fp4(self, device):
+        """Compare native Metal kernel vs Python fallback for FP4 embedding."""
+        if device != 'mps':
+            pytest.skip("Native kernels require MPS")
+
+        vocab_size, embed_dim = 500, 128
+        embed = nn.Embedding(vocab_size, embed_dim).half().to(device)
+        embed_4bit = Embedding4bit.from_embedding(embed, quant_type='fp4', device=device)
+
+        indices = torch.randint(0, vocab_size, (4, 16), device=device)
+
+        native_output = embed_4bit(indices)
+        fallback_output = self._force_fallback_embedding4bit(embed_4bit, indices)
+
+        assert torch.allclose(native_output, fallback_output, atol=1e-3), \
+            f"Max diff: {(native_output - fallback_output).abs().max().item()}"
+
+    def test_native_vs_fallback_embedding8bit(self, device):
+        """Compare native Metal kernel vs Python fallback for 8-bit embedding."""
+        if device != 'mps':
+            pytest.skip("Native kernels require MPS")
+
+        vocab_size, embed_dim = 500, 128
+        embed = nn.Embedding(vocab_size, embed_dim).half().to(device)
+        embed_8bit = Embedding8bit.from_embedding(embed, device=device)
+
+        indices = torch.randint(0, vocab_size, (4, 16), device=device)
+
+        # Native path
+        native_output = embed_8bit(indices)
+
+        # Python fallback
+        weight_int8 = embed_8bit.weight_int8[indices]
+        scales = embed_8bit.weight_scales[indices]
+        fallback_output = weight_int8.to(embed_8bit.dtype) * (scales.unsqueeze(-1) / 127.0).to(embed_8bit.dtype)
+
+        # Native kernel computes in float32 then converts to half;
+        # fallback truncates scale to half before multiply, causing ~1 ULP diff
+        assert torch.allclose(native_output, fallback_output, atol=2e-3), \
+            f"Max diff: {(native_output - fallback_output).abs().max().item()}"
+
+    def test_large_vocabulary_embedding(self, device):
+        """Stress test with large vocabulary."""
+        if device != 'mps':
+            pytest.skip("Native kernels require MPS")
+
+        vocab_size, embed_dim = 50000, 4096
+        embed = nn.Embedding(vocab_size, embed_dim).half().to(device)
+        embed_4bit = Embedding4bit.from_embedding(embed, device=device)
+
+        indices = torch.randint(0, vocab_size, (2, 512), device=device)
+        output = embed_4bit(indices)
+
+        assert output.shape == (2, 512, embed_dim)
+        assert not torch.isnan(output).any()
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
